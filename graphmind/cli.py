@@ -14,7 +14,7 @@ import argparse
 import json
 from pathlib import Path
 
-from . import build, cluster, export, llm, query
+from . import build, cache as cache_module, cluster, export, llm, query
 from .detect import collect_files
 from .extractors.code_python import extract_python
 from .extractors.image import extract_image
@@ -64,6 +64,29 @@ def run_pipeline(root: Path, out_dir: Path) -> None:
 
     print(f"[graphmind] {len(files)} fichier(s) détecté(s) dans {root}")
 
+    # Charge le cache existant (vide si c'est le premier build sur ce projet).
+    # Chaque fichier sera comparé à sa version en cache par empreinte de
+    # contenu — s'il n'a PAS changé, on réutilise l'extraction précédente
+    # au lieu de refaire le travail (AST ou, surtout, appel LLM coûteux).
+    file_cache = cache_module.load_cache(out_dir)
+    current_relative_paths = {str(f.path.relative_to(root)) for f in files}
+    cache_module.prune_deleted_files(file_cache, current_relative_paths)
+    cache_hits = 0
+    cache_misses = 0
+
+    def extract_or_reuse(path: Path, relative_path: str, extractor_fn):
+        """Retourne le résultat en cache si le fichier n'a pas changé,
+        sinon appelle réellement l'extracteur et met à jour le cache."""
+        nonlocal cache_hits, cache_misses
+        cached = cache_module.get_cached_result(file_cache, path, relative_path)
+        if cached is not None:
+            cache_hits += 1
+            return cached
+        cache_misses += 1
+        result = extractor_fn()
+        cache_module.store_result(file_cache, path, relative_path, result)
+        return result
+
     results: list[ExtractionResult] = []
     known_code_symbols: dict[str, str] = {}
 
@@ -80,7 +103,7 @@ def run_pipeline(root: Path, out_dir: Path) -> None:
             continue
         rel = str(f.path.relative_to(root))
         if f.language == "python":
-            r = extract_python(f.path, rel, known_modules)
+            r = extract_or_reuse(f.path, rel, lambda f=f, rel=rel: extract_python(f.path, rel, known_modules))
             results.append(r)
             for node in r.nodes:
                 simple_name = node.label.strip("().").lstrip(".")
@@ -101,18 +124,21 @@ def run_pipeline(root: Path, out_dir: Path) -> None:
             print(f"  [sécurité] {rel} -> traitement local forcé ({decision.reason})")
 
         if f.modality == Modality.DOCUMENT:
-            results.append(extract_text_doc(f.path, rel, known_code_symbols))
+            results.append(extract_or_reuse(f.path, rel, lambda f=f, rel=rel: extract_text_doc(f.path, rel, known_code_symbols)))
         elif f.modality == Modality.PDF:
-            results.append(extract_pdf(f.path, rel, decision.force_local))
+            results.append(extract_or_reuse(f.path, rel, lambda f=f, rel=rel, d=decision: extract_pdf(f.path, rel, d.force_local)))
         elif f.modality == Modality.IMAGE:
-            results.append(extract_image(f.path, rel, decision.force_local, known_code_symbols))
+            results.append(extract_or_reuse(f.path, rel, lambda f=f, rel=rel, d=decision: extract_image(f.path, rel, d.force_local, known_code_symbols)))
         elif f.modality == Modality.VIDEO:
-            results.append(extract_video(f.path, rel, decision.force_local))
+            results.append(extract_or_reuse(f.path, rel, lambda f=f, rel=rel, d=decision: extract_video(f.path, rel, d.force_local)))
+
+    cache_module.save_cache(out_dir, file_cache)
 
     graph = build.build_graph(results)
     cluster.cluster_graph(graph)
     export.export_graph(graph, out_dir)
 
+    print(f"[graphmind] Cache : {cache_hits} fichier(s) réutilisé(s) tel quel, {cache_misses} extrait(s) réellement")
     print(f"[graphmind] Graphe construit : {graph.number_of_nodes()} nœuds, {graph.number_of_edges()} relations")
     print(f"[graphmind] Résultats écrits dans {out_dir}")
 

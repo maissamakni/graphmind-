@@ -42,6 +42,18 @@ et à l'étude de cas pratique du projet open-source `graphify`.
   via Ollama) selon le backend arbitré par `security.py` ; la légende obtenue
   est ensuite reliée aux symboles de code déjà connus si elle les mentionne
   (même principe de liaison cross-modale que pour la documentation texte).
+- **Cache d'extraction incrémental** (`cache.py`) : ajouter un nouveau fichier
+  (code, document, PDF, image ou vidéo) à un projet déjà construit ne
+  déclenche PAS une ré-extraction de tout le projet — seuls les fichiers
+  nouveaux ou modifiés (détectés par empreinte de contenu, pas par date) sont
+  réellement traités ; les autres sont réutilisés depuis le cache
+  (`<out_dir>/.graphmind-cache.json`). Nuance importante : c'est
+  l'**extraction** qui est incrémentale (la partie coûteuse en tokens pour
+  PDF/images/vidéo), pas le graphe lui-même — `graph.json`/`graph.html`/
+  `REPORT.md` sont toujours entièrement reconstruits à chaque `build`, à
+  partir de résultats en partie recyclés, en partie neufs. Ce recalcul du
+  graphe est gratuit en tokens (aucun LLM) donc ce n'est pas un problème
+  pratique, mais ce n'est pas un simple ajout de nœuds au fichier existant.
 - **Séparation stricte indexation / requête** : `query.py` ne renvoie jamais le
   graphe complet, seulement un sous-graphe ciblé (les nœuds les mieux classés
   après propagation PPR).
@@ -135,6 +147,8 @@ graphmind/
 ├── ids.py          # génération d'identifiants stables (clé fichier+symbole)
 ├── security.py     # arbitrage local/externe par fichier
 ├── envfile.py      # chargement du fichier .env
+├── cache.py        # cache d'extraction (empreinte de contenu) — évite de
+│                     ré-extraire un fichier inchangé à chaque build
 ├── llm.py          # interface LLM unifiée (Anthropic/OpenAI/Groq/Ollama)
 ├── detect.py       # détection et classification par modalité
 ├── extractors/
