@@ -1,0 +1,17 @@
+# Environnement Python
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets — NE JAMAIS publier de clé API
+.env
+
+# Sorties générées par graphmind (régénérables via `graphmind build`)
+*-graphmind-out/
+*-out/
+
+# Fichiers spécifiques à l'éditeur / l'OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
