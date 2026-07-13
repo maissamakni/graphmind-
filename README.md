@@ -32,8 +32,19 @@ et à l'étude de cas pratique du projet open-source `graphify`.
 - **Clustering par l'algorithme de Leiden** (comme Microsoft GraphRAG et
   graphify), avec repli automatique sur la modularité gloutonne de NetworkX
   si `python-igraph`/`leidenalg` ne sont pas installés — jamais d'erreur bloquante.
+- **Requête par propagation de score (PPR)** : comme HippoRAG2, la requête
+  identifie les nœuds-graines mentionnés dans la question, puis propage un
+  score de pertinence à travers tout le graphe via l'algorithme Personalized
+  PageRank (`nx.pagerank`) — un score continu qui décroît naturellement avec
+  la distance, plutôt qu'une traversée en largeur (BFS) à profondeur fixe.
+- **Génération réelle de légendes d'image** : les images sont envoyées à un
+  modèle de vision (Claude, GPT-4o, Llama vision via Groq, ou LLaVA en local
+  via Ollama) selon le backend arbitré par `security.py` ; la légende obtenue
+  est ensuite reliée aux symboles de code déjà connus si elle les mentionne
+  (même principe de liaison cross-modale que pour la documentation texte).
 - **Séparation stricte indexation / requête** : `query.py` ne renvoie jamais le
-  graphe complet, seulement un sous-graphe ciblé (BFS borné en profondeur).
+  graphe complet, seulement un sous-graphe ciblé (les nœuds les mieux classés
+  après propagation PPR).
 - **Réponse en langage naturel** : la requête ne renvoie jamais de JSON brut —
   une vraie phrase est générée par le LLM configuré (Anthropic, OpenAI, Groq,
   Ollama), ou un résumé déterministe si aucun backend n'est disponible.
@@ -112,11 +123,9 @@ signaler clairement qu'une fonctionnalité n'existe pas dans le code analysé.
   encore supporté"), mais l'extracteur réel reste à écrire, sur le modèle de
   `extractors/code_python.py`. PHP et les autres langages ne sont pas encore
   reconnus du tout (à ajouter d'abord dans `detect.py`, puis un extracteur dédié).
-- Extraction sémantique image : squelette fonctionnel, la génération réelle
-  de légendes n'est pas encore branchée (`extractors/image.py`).
-- Requête : traversée BFS simple (pas de propagation par score type PPR
-  utilisée par HippoRAG2) — piste d'amélioration documentée dans le rapport
-  de recherche.
+- La génération de légende d'image nécessite un modèle réellement capable de
+  vision (tous les modèles ne le sont pas) — vérifier que le modèle configuré
+  supporte la vision avant d'attendre un résultat.
 
 ## Structure du projet
 
@@ -134,12 +143,13 @@ graphmind/
 │   │                       pour la résolution cross-fichier
 │   ├── text_doc.py       # Markdown + liaison cross-modale
 │   ├── pdf_doc.py        # pypdf + extraction sémantique LLM
-│   ├── image.py          # métadonnées + légende LLM (squelette)
+│   ├── image.py          # métadonnées + légende générée par un modèle de
+│   │                       vision (Claude/GPT-4o/Groq vision/LLaVA)
 │   └── video.py          # transcription locale (faster-whisper) + LLM
 ├── build.py        # assemble tout en un graphe NetworkX + résout les
 │                     collisions d'identifiants entre fichiers différents
 ├── cluster.py       # détection de communautés (Leiden, repli gloutonne)
-├── query.py          # requête -> sous-graphe ciblé (BFS)
+├── query.py          # requête -> sous-graphe ciblé (Personalized PageRank)
 ├── export.py          # graph.json + graph.html (communautés, recherche,
 │                         inspection de nœud) + REPORT.md
 └── cli.py              # orchestration : build / query, résolution

@@ -219,3 +219,92 @@ def _fallback_answer(context: str, reason: str = "aucun backend LLM configuré")
         return "Aucune information pertinente trouvée dans le graphe pour cette question."
     resume = " ; ".join(lines[:6])
     return f"D'après le graphe ({reason}, résumé direct des relations extraites du code) : {resume}."
+
+
+_IMAGE_DESCRIBE_PROMPT = (
+    "Décris cette image en 2-3 phrases en français, en te concentrant sur ce "
+    "qu'elle représente pour un projet logiciel (schéma d'architecture, "
+    "capture d'écran d'interface, diagramme...). Si l'image contient des noms "
+    "de fonctions, classes ou fichiers visibles, cite-les explicitement."
+)
+
+# Modèles capables de "voir" une image, un par backend — les modèles textuels
+# classiques (ex: llama-3.3-70b-versatile) ne peuvent pas traiter d'image.
+_VISION_MODELS = {
+    "anthropic": "claude-sonnet-4-5",
+    "openai": "gpt-4o-mini",
+    "groq": "llama-3.2-11b-vision-preview",
+    "ollama": "llava",
+}
+
+
+def describe_image(image_bytes: bytes, media_type: str, backend: LLMBackend) -> str:
+    """Envoie une image à un modèle de vision et retourne sa description en
+    texte. Retourne une chaîne vide (jamais d'exception) si aucun backend
+    n'est configuré ou si l'appel échoue — cohérent avec le reste du module :
+    l'absence de légende ne doit jamais bloquer le reste du pipeline.
+    """
+    if backend.name == "none":
+        return ""
+
+    import base64
+    b64_image = base64.b64encode(image_bytes).decode("ascii")
+    model = _VISION_MODELS.get(backend.name, backend.model)
+
+    try:
+        if backend.name == "anthropic":
+            import anthropic
+            client = anthropic.Anthropic()
+            resp = client.messages.create(
+                model=model, max_tokens=300,
+                messages=[{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64_image}},
+                    {"type": "text", "text": _IMAGE_DESCRIBE_PROMPT},
+                ]}],
+            )
+            return "".join(b.text for b in resp.content if hasattr(b, "text")).strip()
+
+        if backend.name in ("openai", "groq"):
+            # Les deux exposent une API compatible avec le format "vision" d'OpenAI
+            # (content = liste de blocs image_url / text) — seule l'URL de base change.
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{b64_image}"}},
+                    {"type": "text", "text": _IMAGE_DESCRIBE_PROMPT},
+                ]}],
+            }
+            if backend.name == "openai":
+                import openai
+                client = openai.OpenAI()
+                resp = client.chat.completions.create(**payload)
+                return (resp.choices[0].message.content or "").strip()
+            else:  # groq
+                import urllib.request
+                req = urllib.request.Request(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {os.environ.get('GROQ_API_KEY', '')}",
+                        "User-Agent": "graphmind/1.0",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                return data["choices"][0]["message"]["content"].strip()
+
+        if backend.name == "ollama":
+            import urllib.request
+            payload = json.dumps({
+                "model": model, "prompt": _IMAGE_DESCRIBE_PROMPT,
+                "images": [b64_image], "stream": False,
+            }).encode("utf-8")
+            req = urllib.request.Request("http://localhost:11434/api/generate", data=payload,
+                                          headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read().decode("utf-8")).get("response", "").strip()
+    except Exception as exc:
+        print(f"[graphmind] avertissement : échec de la description d'image via '{backend.name}' ({exc}).", file=sys.stderr)
+        return ""
+    return ""
