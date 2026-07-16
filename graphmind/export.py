@@ -6,6 +6,8 @@ from pathlib import Path
 
 import networkx as nx
 
+from . import llm
+
 # Palette cyclique par communauté (assez de couleurs distinctes avant répétition)
 _COMMUNITY_PALETTE = [
     "#4f8ef7", "#f7924f", "#e0554f", "#4fd68c", "#c084f5",
@@ -70,11 +72,28 @@ function communityColor(c) {{
   return "#888";
 }}
 
+// Taille des nœuds proportionnelle au nombre de connexions (comme les
+// "god nodes" de graphify) — un nœud très connecté (ex: une classe centrale
+// comme "Account") se voit visuellement plus important qu'un nœud isolé.
+const degreeCount = {{}};
+graphData.edges.forEach(e => {{
+  degreeCount[e.source] = (degreeCount[e.source] || 0) + 1;
+  degreeCount[e.target] = (degreeCount[e.target] || 0) + 1;
+}});
+const BASE_SIZE = 10;
+const MAX_SIZE = 45;
+const SIZE_PER_EDGE = 4;
+function nodeSize(id) {{
+  const degree = degreeCount[id] || 0;
+  return Math.min(BASE_SIZE + degree * SIZE_PER_EDGE, MAX_SIZE);
+}}
+
 const allNodes = graphData.nodes.map(n => ({{
   id: n.id,
   label: n.label,
+  size: nodeSize(n.id),
   color: {{ background: communityColor(n.community), border: communityColor(n.community) }},
-  title: n.modality + " — " + n.source_file,
+  title: n.modality + " — " + n.source_file + " (" + (degreeCount[n.id] || 0) + " connexions)",
   _raw: n,
 }}));
 const allEdges = graphData.edges.map((e, i) => ({{
@@ -89,7 +108,7 @@ const edges = new vis.DataSet(allEdges);
 
 const network = new vis.Network(document.getElementById("network"), {{nodes, edges}}, {{
   physics: {{ stabilization: true, barnesHut: {{ gravitationalConstant: -4000, springLength: 120 }} }},
-  nodes: {{ shape: "dot", size: 14, font: {{ color: "#e6e6e6", size: 13 }} }},
+  nodes: {{ shape: "dot", font: {{ color: "#e6e6e6", size: 13 }} }},
   interaction: {{ hover: true }},
 }});
 
@@ -167,19 +186,33 @@ document.getElementById("footer").textContent =
 
 def _build_community_info(graph: nx.DiGraph) -> dict:
     """Pour chaque communauté : une couleur stable, un label représentatif
-    (le nœud le plus connecté du groupe) et le nombre de nœuds."""
+    et le nombre de nœuds.
+
+    Le label est d'abord tenté via un nommage sémantique par LLM (un seul
+    appel PAR COMMUNAUTÉ, pas par fichier — même principe que le résumé de
+    communauté de Microsoft GraphRAG), à partir des labels des membres les
+    plus connectés. Si aucun backend n'est disponible ou que l'appel échoue,
+    on retombe sur le nom MÉCANIQUE (le nœud le plus connecté du groupe) —
+    jamais d'erreur bloquante, jamais de communauté sans nom.
+    """
     groups: dict[str, list[str]] = {}
     for node_id, data in graph.nodes(data=True):
         cid = str(data.get("community", "0"))
         groups.setdefault(cid, []).append(node_id)
 
     degrees = dict(graph.to_undirected().degree())
+    backend = llm.resolve_backend(force_local=False)
     info: dict[str, dict] = {}
     for idx, (cid, members) in enumerate(sorted(groups.items(), key=lambda kv: int(kv[0]))):
-        representative = max(members, key=lambda n: degrees.get(n, 0))
-        label = graph.nodes[representative].get("label", representative)
+        ranked_members = sorted(members, key=lambda n: degrees.get(n, 0), reverse=True)
+        representative = ranked_members[0]
+        mechanical_label = graph.nodes[representative].get("label", representative)
+
+        top_labels = [str(graph.nodes[m].get("label", m)) for m in ranked_members[:8]]
+        semantic_label = llm.name_community(top_labels, backend) if len(members) > 1 else None
+
         info[cid] = {
-            "label": label,
+            "label": semantic_label or mechanical_label,
             "count": len(members),
             "color": _COMMUNITY_PALETTE[idx % len(_COMMUNITY_PALETTE)],
         }

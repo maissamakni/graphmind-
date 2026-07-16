@@ -22,8 +22,10 @@ import re
 
 import networkx as nx
 
+from .graph_utils import to_weighted_simple_undirected
 
-def find_seed_nodes(graph: nx.DiGraph, question: str) -> list[str]:
+
+def find_seed_nodes(graph: nx.MultiDiGraph, question: str) -> list[str]:
     """Trouve les nœuds dont le label apparaît (mot entier) dans la question."""
     words = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", question))
     seeds = []
@@ -34,7 +36,7 @@ def find_seed_nodes(graph: nx.DiGraph, question: str) -> list[str]:
     return seeds
 
 
-def query(graph: nx.DiGraph, question: str, top_k: int = 20) -> dict:
+def query(graph: nx.MultiDiGraph, question: str, top_k: int = 20) -> dict:
     """Retourne un sous-graphe {"nodes": [...], "edges": [...]} pertinent
     pour la question, au lieu du graphe complet — c'est le levier de
     réduction de tokens central de toute l'architecture.
@@ -47,19 +49,41 @@ def query(graph: nx.DiGraph, question: str, top_k: int = 20) -> dict:
     if not seeds:
         return {"seeds": [], "nodes": [], "edges": [], "note": "aucun nœud correspondant trouvé"}
 
-    undirected = graph.to_undirected()
+    # Graphe "aplati" en simple/non-orienté, pondéré par la CONFIANCE des
+    # relations d'origine (cf. graph_utils.py) — la propagation fait donc
+    # davantage confiance à un chemin soutenu par des relations EXTRACTED
+    # (lecture AST certaine) qu'à un chemin qui ne repose que sur des
+    # relations INFERRED (déduites par LLM).
+    weighted_undirected = to_weighted_simple_undirected(graph)
+
+    # Restreindre aux composantes connexes qui contiennent au moins une
+    # graine. Sans ça, un nœud d'une partie du projet totalement isolée
+    # (ex: le module "notifications" qui n'importe jamais "database") reçoit
+    # quand même un score PPR RÉSIDUEL non nul (de l'ordre de 10⁻⁶) — pas
+    # zéro exact, à cause du nombre fini d'itérations de l'algorithme partant
+    # d'une estimation initiale uniforme sur tous les nœuds — ce qui suffit à
+    # le faire apparaître dans le classement si le graphe a peu de nœuds
+    # réellement pertinents. Un simple seuil numérique est fragile (le bon
+    # seuil dépend de la taille du graphe) ; restreindre aux composantes
+    # connexes règle le problème à la racine plutôt que par un réglage
+    # approximatif.
+    relevant_nodes: set[str] = set()
+    for component in nx.connected_components(weighted_undirected):
+        if component & set(seeds):
+            relevant_nodes |= component
+    scoped_graph = weighted_undirected.subgraph(relevant_nodes)
 
     # Personalized PageRank : le vecteur de personnalisation concentre TOUT le
     # score de départ sur les nœuds-graines (poids égal entre elles) ; le
     # reste du graphe ne reçoit un score que par propagation depuis ces graines.
-    personalization = {node_id: (1.0 if node_id in seeds else 0.0) for node_id in undirected.nodes}
+    personalization = {node_id: (1.0 if node_id in seeds else 0.0) for node_id in scoped_graph.nodes}
     try:
-        scores = nx.pagerank(undirected, alpha=0.85, personalization=personalization)
+        scores = nx.pagerank(scoped_graph, alpha=0.85, personalization=personalization, weight="weight")
     except nx.PowerIterationFailedConvergence:
         # Repli rare (graphe pathologique) : score uniforme, tout le monde à
         # égalité — le tri par score suivant ne changera rien, mais on ne
         # plante jamais le pipeline pour autant.
-        scores = {node_id: 1.0 for node_id in undirected.nodes}
+        scores = {node_id: 1.0 for node_id in scoped_graph.nodes}
 
     # Classement par score décroissant ; les graines elles-mêmes sont
     # explicitement forcées en tête (score le plus élevé par construction),
@@ -73,6 +97,10 @@ def query(graph: nx.DiGraph, question: str, top_k: int = 20) -> dict:
         keep_extra = max(0, top_k - len(seeds))
         visited = set(seeds) | set(non_seed_ranked[:keep_extra])
 
+    # sub reste tiré du graphe MultiDiGraph d'origine (pas de la version
+    # aplatie) : on garde ainsi TOUTES les relations distinctes entre deux
+    # nœuds (ex: "imports_from" ET "calls" tous les deux), pas juste une
+    # seule arête fusionnée.
     sub = graph.subgraph(visited)
 
     return {

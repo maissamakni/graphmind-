@@ -87,6 +87,11 @@ class ExtractionResult:
     # dans un second temps (cli.py), une fois que tous les fichiers sont extraits.
     # Chaque entrée : {"caller_id": str, "callee_name": str, "source_file": str, "line": str}
     raw_calls: list[dict] = field(default_factory=list)
+    # True si l'extraction sémantique (LLM) a échoué ou n'a rien produit —
+    # cache.py NE DOIT JAMAIS mettre ce résultat en cache dans ce cas, sinon
+    # un échec ponctuel (clé invalide, modèle temporairement indisponible...)
+    # resterait bloqué indéfiniment même après correction du problème.
+    extraction_incomplete: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -98,3 +103,4 @@ class ExtractionResult:
         self.nodes.extend(other.nodes)
         self.edges.extend(other.edges)
         self.raw_calls.extend(other.raw_calls)
+        self.extraction_incomplete = self.extraction_incomplete or other.extraction_incomplete

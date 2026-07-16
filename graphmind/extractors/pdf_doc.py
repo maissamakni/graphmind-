@@ -37,6 +37,8 @@ def extract_pdf(path: Path, relative_path: str, force_local: bool) -> Extraction
     semantic = llm.extract_semantic(text, backend)
 
     confidence = Confidence.INFERRED if backend.name != "none" else Confidence.AMBIGUOUS
+    if semantic.get("_error"):
+        result.extraction_incomplete = True
     for entity in semantic.get("entities", []):
         name = entity.get("name")
         if not name:
@@ -64,5 +66,6 @@ def extract_pdf(path: Path, relative_path: str, force_local: bool) -> Extraction
             Modality.CONCEPT, relative_path,
             metadata={"reason": semantic.get("_skipped", "no backend")},
         ))
+        result.extraction_incomplete = True
 
     return result

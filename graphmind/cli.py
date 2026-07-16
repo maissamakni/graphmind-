@@ -57,7 +57,7 @@ def _resolve_cross_file_calls(results: list[ExtractionResult]) -> None:
             ))
 
 
-def run_pipeline(root: Path, out_dir: Path) -> None:
+def run_pipeline(root: Path, out_dir: Path, do_cluster: bool = True) -> None:
     root = Path(root).resolve()
     files = collect_files(root)
     policy = SecurityPolicy()
@@ -124,18 +124,22 @@ def run_pipeline(root: Path, out_dir: Path) -> None:
             print(f"  [sécurité] {rel} -> traitement local forcé ({decision.reason})")
 
         if f.modality == Modality.DOCUMENT:
-            results.append(extract_or_reuse(f.path, rel, lambda f=f, rel=rel: extract_text_doc(f.path, rel, known_code_symbols)))
+            results.append(extract_or_reuse(f.path, rel, lambda f=f, rel=rel, d=decision: extract_text_doc(f.path, rel, known_code_symbols, d.force_local)))
         elif f.modality == Modality.PDF:
             results.append(extract_or_reuse(f.path, rel, lambda f=f, rel=rel, d=decision: extract_pdf(f.path, rel, d.force_local)))
         elif f.modality == Modality.IMAGE:
             results.append(extract_or_reuse(f.path, rel, lambda f=f, rel=rel, d=decision: extract_image(f.path, rel, d.force_local, known_code_symbols)))
         elif f.modality == Modality.VIDEO:
-            results.append(extract_or_reuse(f.path, rel, lambda f=f, rel=rel, d=decision: extract_video(f.path, rel, d.force_local)))
+            results.append(extract_or_reuse(f.path, rel, lambda f=f, rel=rel, d=decision: extract_video(f.path, rel, d.force_local, known_code_symbols)))
 
     cache_module.save_cache(out_dir, file_cache)
 
     graph = build.build_graph(results)
-    cluster.cluster_graph(graph)
+    if do_cluster:
+        cluster.cluster_graph(graph)
+    else:
+        print("[graphmind] Clustering ignoré (--no-cluster) — les nœuds n'auront pas d'attribut 'community' "
+              "tant que `graphmind cluster` n'aura pas été lancé séparément.")
     export.export_graph(graph, out_dir)
 
     print(f"[graphmind] Cache : {cache_hits} fichier(s) réutilisé(s) tel quel, {cache_misses} extrait(s) réellement")
@@ -159,7 +163,7 @@ def _build_context(subgraph: dict) -> str:
 def run_query(out_dir: Path, question: str) -> None:
     import networkx as nx
     data = json.loads((out_dir / "graph.json").read_text(encoding="utf-8"))
-    graph = nx.node_link_graph(data, edges="edges", directed=True)
+    graph = nx.node_link_graph(data, edges="edges", directed=True, multigraph=True)
     subgraph = query.query(graph, question)
 
     if not subgraph["nodes"]:
@@ -173,6 +177,47 @@ def run_query(out_dir: Path, question: str) -> None:
     print(answer)
 
 
+def run_cluster(out_dir: Path) -> None:
+    """Recharge un graphe déjà construit (via `build --no-cluster`) et
+    applique SEULEMENT le clustering, sans refaire l'extraction ni la
+    construction du graphe. Utile sur un gros projet : on encaisse le coût
+    du clustering uniquement quand on en a vraiment besoin, pas à chaque
+    petite modification."""
+    import networkx as nx
+    graph_path = out_dir / "graph.json"
+    if not graph_path.is_file():
+        print(f"[graphmind] Aucun graphe trouvé dans {out_dir} — lance d'abord `graphmind build`.")
+        return
+
+    data = json.loads(graph_path.read_text(encoding="utf-8"))
+    graph = nx.node_link_graph(data, edges="edges", directed=True, multigraph=True)
+
+    cluster.cluster_graph(graph)
+    export.export_graph(graph, out_dir)
+    print(f"[graphmind] Clustering recalculé sur {graph.number_of_nodes()} nœuds.")
+    print(f"[graphmind] Résultats mis à jour dans {out_dir}")
+
+
+def run_status(root: Path, out_dir: Path) -> None:
+    """Vérifie si le projet a changé depuis le dernier build, SANS rien
+    extraire — pour décider en un clin d'œil si `graphmind build` vaut la
+    peine d'être relancé. Coût quasi nul (juste des empreintes de fichiers),
+    à utiliser avant un vrai build sur un gros projet."""
+    root = Path(root).resolve()
+    files = collect_files(root)
+    file_cache = cache_module.load_cache(out_dir)
+
+    file_pairs = [(f.path, str(f.path.relative_to(root))) for f in files]
+    status = cache_module.check_status(file_cache, file_pairs)
+
+    print(json.dumps(status, indent=2, ensure_ascii=False))
+    if status["needs_rebuild"]:
+        print(f"\n[graphmind] Reconstruction nécessaire : {len(status['new'])} nouveau(x), "
+              f"{len(status['changed'])} modifié(s), {len(status['deleted'])} supprimé(s).")
+    else:
+        print("\n[graphmind] Rien n'a changé — inutile de relancer `build`.")
+
+
 def main() -> None:
     from .envfile import load_dotenv
     load_dotenv()
@@ -183,6 +228,15 @@ def main() -> None:
     build_cmd = sub.add_parser("build", help="Construit le graphe depuis un dossier")
     build_cmd.add_argument("path", type=Path)
     build_cmd.add_argument("--out", type=Path, default=Path("graphmind-out"))
+    build_cmd.add_argument("--no-cluster", action="store_true",
+                            help="Ignore le recalcul des communautés (rapide) — à relancer séparément via `graphmind cluster`")
+
+    cluster_cmd = sub.add_parser("cluster", help="Recalcule uniquement le clustering d'un graphe déjà construit")
+    cluster_cmd.add_argument("--out", type=Path, default=Path("graphmind-out"))
+
+    status_cmd = sub.add_parser("status", help="Vérifie si une reconstruction est nécessaire, sans rien extraire")
+    status_cmd.add_argument("path", type=Path)
+    status_cmd.add_argument("--out", type=Path, default=Path("graphmind-out"))
 
     query_cmd = sub.add_parser("query", help="Interroge un graphe déjà construit")
     query_cmd.add_argument("question", type=str)
@@ -190,7 +244,11 @@ def main() -> None:
 
     args = parser.parse_args()
     if args.command == "build":
-        run_pipeline(args.path, args.out)
+        run_pipeline(args.path, args.out, do_cluster=not args.no_cluster)
+    elif args.command == "cluster":
+        run_cluster(args.out)
+    elif args.command == "status":
+        run_status(args.path, args.out)
     elif args.command == "query":
         run_query(args.out, args.question)
 

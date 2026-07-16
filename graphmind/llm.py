@@ -39,7 +39,7 @@ def resolve_backend(force_local: bool) -> LLMBackend:
     if os.environ.get("OPENAI_API_KEY"):
         return LLMBackend("openai", "gpt-4o-mini")
     if os.environ.get("GROQ_API_KEY"):
-        return LLMBackend("groq", "llama-3.3-70b-versatile")
+        return LLMBackend("groq", "openai/gpt-oss-120b")
     if os.environ.get("GRAPHMIND_OLLAMA_MODEL"):
         return LLMBackend("ollama", os.environ["GRAPHMIND_OLLAMA_MODEL"])
     return LLMBackend("none")
@@ -89,6 +89,13 @@ def _parse_json_response(raw: str) -> dict:
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
+        # Cas important à diagnostiquer : la requête a RÉUSSI (pas d'erreur
+        # HTTP), mais le modèle n'a pas répondu dans le format JSON attendu
+        # (refus, réponse en prose, format inattendu...). Sans ce message,
+        # l'échec est totalement silencieux — on voit juste "aucune entité
+        # extraite" sans savoir pourquoi.
+        apercu = raw[:200].replace("\n", " ")
+        print(f"[graphmind] avertissement : réponse LLM non-JSON reçue, aperçu : {apercu!r}", file=sys.stderr)
         return {"entities": [], "relations": []}
 
 
@@ -109,6 +116,9 @@ def _call_openai(prompt: str, model: str | None) -> dict:
     client = openai.OpenAI()
     resp = client.chat.completions.create(
         model=model or "gpt-4o-mini",
+        max_tokens=1500,  # sans cette limite explicite généreuse, la réponse
+                          # peut être tronquée en plein milieu du JSON (bug
+                          # observé et corrigé — touchait aussi PDF/texte).
         messages=[{"role": "user", "content": prompt}],
     )
     return _parse_json_response(resp.choices[0].message.content or "")
@@ -141,6 +151,9 @@ def _call_groq(prompt: str, model: str | None) -> str:
     import urllib.request
     payload = json.dumps({
         "model": model or "llama-3.3-70b-versatile",
+        "max_tokens": 1500,  # même correction que _call_openai : sans limite
+                             # explicite, la réponse peut être tronquée avant
+                             # que le JSON soit complet.
         "messages": [{"role": "user", "content": prompt}],
     }).encode("utf-8")
     req = urllib.request.Request(
@@ -211,6 +224,63 @@ def answer_question(question: str, context: str, backend: LLMBackend) -> str:
     return _fallback_answer(context)
 
 
+_COMMUNITY_NAME_PROMPT = """Voici les noms des éléments (fonctions, classes, fichiers) qui
+composent une communauté d'un graphe de connaissances de projet logiciel :
+
+{labels}
+
+Donne un nom court et descriptif pour cette communauté (2 à 5 mots, comme
+"Account Auth Flow" ou "Payments & Transactions"). Réponds UNIQUEMENT avec
+ce nom, sans ponctuation finale, sans guillemets, rien d'autre autour.
+"""
+
+
+def name_community(labels: list[str], backend: LLMBackend) -> str | None:
+    """Génère un nom descriptif pour une communauté à partir des labels de
+    ses membres les plus représentatifs — un seul appel LLM PAR COMMUNAUTÉ
+    (pas par fichier), même principe que le résumé de communauté de
+    Microsoft GraphRAG. Retourne None si aucun backend n'est disponible ou
+    si l'appel échoue — l'appelant doit alors garder son nom de repli
+    mécanique (ex: le label du nœud le plus connecté).
+    """
+    if backend.name == "none" or not labels:
+        return None
+
+    prompt = _COMMUNITY_NAME_PROMPT.format(labels=", ".join(labels[:12]))
+    try:
+        if backend.name == "anthropic":
+            import anthropic
+            client = anthropic.Anthropic()
+            resp = client.messages.create(
+                model=backend.model or "claude-sonnet-4-5", max_tokens=20,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            name = "".join(b.text for b in resp.content if hasattr(b, "text")).strip()
+        elif backend.name == "openai":
+            import openai
+            client = openai.OpenAI()
+            resp = client.chat.completions.create(
+                model=backend.model or "gpt-4o-mini", max_tokens=20,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            name = (resp.choices[0].message.content or "").strip()
+        elif backend.name == "groq":
+            name = _call_groq(prompt, backend.model).strip()
+        elif backend.name == "ollama":
+            import urllib.request
+            payload = json.dumps({"model": backend.model or "llama3", "prompt": prompt, "stream": False}).encode("utf-8")
+            req = urllib.request.Request("http://localhost:11434/api/generate", data=payload,
+                                          headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                name = json.loads(resp.read().decode("utf-8")).get("response", "").strip()
+        else:
+            return None
+        return name.strip('"\'.') or None
+    except Exception as exc:
+        print(f"[graphmind] avertissement : nommage de communauté échoué via '{backend.name}' ({exc}).", file=sys.stderr)
+        return None
+
+
 def _fallback_answer(context: str, reason: str = "aucun backend LLM configuré") -> str:
     """Résumé simple et déterministe (sans LLM) — toujours une phrase en
     français, jamais du JSON brut, même sans backend configuré."""
@@ -230,10 +300,13 @@ _IMAGE_DESCRIBE_PROMPT = (
 
 # Modèles capables de "voir" une image, un par backend — les modèles textuels
 # classiques (ex: llama-3.3-70b-versatile) ne peuvent pas traiter d'image.
+# Note : le catalogue de modèles Groq change fréquemment (plusieurs
+# dépréciations successives observées) — si ce nom cesse de fonctionner,
+# vérifier https://console.groq.com/docs/vision pour le modèle vision actuel.
 _VISION_MODELS = {
     "anthropic": "claude-sonnet-4-5",
     "openai": "gpt-4o-mini",
-    "groq": "llama-3.2-11b-vision-preview",
+    "groq": "meta-llama/llama-4-scout-17b-16e-instruct",
     "ollama": "llava",
 }
 
@@ -267,8 +340,11 @@ def describe_image(image_bytes: bytes, media_type: str, backend: LLMBackend) -> 
         if backend.name in ("openai", "groq"):
             # Les deux exposent une API compatible avec le format "vision" d'OpenAI
             # (content = liste de blocs image_url / text) — seule l'URL de base change.
+            # max_tokens explicite : sans lui, la limite par défaut de l'API peut
+            # couper la réponse en plein milieu (bug observé et corrigé).
             payload = {
                 "model": model,
+                "max_tokens": 300,
                 "messages": [{"role": "user", "content": [
                     {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{b64_image}"}},
                     {"type": "text", "text": _IMAGE_DESCRIBE_PROMPT},
@@ -308,3 +384,94 @@ def describe_image(image_bytes: bytes, media_type: str, backend: LLMBackend) -> 
         print(f"[graphmind] avertissement : échec de la description d'image via '{backend.name}' ({exc}).", file=sys.stderr)
         return ""
     return ""
+
+
+_IMAGE_EXTRACT_PROMPT = """Tu analyses une image issue d'un projet logiciel (schéma
+d'architecture, capture d'écran de code, diagramme...) pour en tirer un graphe de
+connaissances. Si l'image contient du CODE SOURCE visible (ex: une capture d'écran),
+LIS-LE ATTENTIVEMENT et extrais les vraies fonctions/classes qu'il définit ainsi que
+leurs appels réels — pas une paraphrase, la structure exacte du code affiché.
+
+Réponds UNIQUEMENT en JSON, sans aucun texte autour, au format exact :
+{{"entities": [{{"name": "...", "type": "fonction|classe|composant|concept"}}],
+  "relations": [{{"source": "...", "target": "...", "relation": "calls|imports|describes"}}]}}
+"""
+
+
+def extract_semantic_from_image(image_bytes: bytes, media_type: str, backend: LLMBackend) -> dict:
+    """Équivalent de extract_semantic(), mais pour une IMAGE — envoie l'image
+    à un modèle de vision et lui demande le même format structuré
+    {"entities": [...], "relations": [...]} que pour un texte, en lui
+    précisant explicitement de LIRE le code s'il en voit (capture d'écran).
+
+    C'est ce qui permet de retrouver, à partir d'une capture d'écran de code,
+    de vraies fonctions et relations "calls" — pas juste une légende en
+    prose qu'on ne peut relier à rien.
+    """
+    if backend.name == "none":
+        return {"entities": [], "relations": [], "_skipped": "no backend configured"}
+
+    import base64
+    b64_image = base64.b64encode(image_bytes).decode("ascii")
+    model = _VISION_MODELS.get(backend.name, backend.model)
+
+    try:
+        if backend.name == "anthropic":
+            import anthropic
+            client = anthropic.Anthropic()
+            resp = client.messages.create(
+                model=model, max_tokens=800,
+                messages=[{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64_image}},
+                    {"type": "text", "text": _IMAGE_EXTRACT_PROMPT},
+                ]}],
+            )
+            text = "".join(b.text for b in resp.content if hasattr(b, "text"))
+            return _parse_json_response(text)
+
+        if backend.name in ("openai", "groq"):
+            # max_tokens explicite (généreux, 1500) : sans lui, l'API tronque
+            # la réponse avant que le JSON soit complet — exactement le bug
+            # observé (réponse coupée en plein milieu d'un tableau "relations").
+            payload = {
+                "model": model,
+                "max_tokens": 1500,
+                "messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{b64_image}"}},
+                    {"type": "text", "text": _IMAGE_EXTRACT_PROMPT},
+                ]}],
+            }
+            if backend.name == "openai":
+                import openai
+                client = openai.OpenAI()
+                resp = client.chat.completions.create(**payload)
+                return _parse_json_response(resp.choices[0].message.content or "")
+            else:  # groq
+                import urllib.request
+                req = urllib.request.Request(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {os.environ.get('GROQ_API_KEY', '')}",
+                        "User-Agent": "graphmind/1.0",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                return _parse_json_response(data["choices"][0]["message"]["content"])
+
+        if backend.name == "ollama":
+            import urllib.request
+            payload = json.dumps({
+                "model": model, "prompt": _IMAGE_EXTRACT_PROMPT,
+                "images": [b64_image], "stream": False,
+            }).encode("utf-8")
+            req = urllib.request.Request("http://localhost:11434/api/generate", data=payload,
+                                          headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return _parse_json_response(json.loads(resp.read().decode("utf-8")).get("response", ""))
+    except Exception as exc:
+        print(f"[graphmind] avertissement : échec de l'extraction structurée d'image via '{backend.name}' ({exc}).", file=sys.stderr)
+        return {"entities": [], "relations": [], "_error": str(exc)}
+    return {"entities": [], "relations": []}

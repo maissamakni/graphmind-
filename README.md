@@ -9,61 +9,57 @@ Ce projet est le résultat de la phase de développement du stage, faisant
 suite à l'étude comparative de Microsoft GraphRAG, HippoRAG2, LlamaIndex,
 et à l'étude de cas pratique du projet open-source `graphify`.
 
-## Principes d'architecture (voir le rapport de recherche pour le détail)
+## Principes d'architecture
 
 - **AST/tree-sitter pour le code** — aucun appel LLM, confiance `EXTRACTED`.
 - **LLM réservé au contenu non structuré** (PDF, images, vidéo) — jamais pour le code.
 - **Sécurité par fichier, pas par projet** (`security.py`) : chaque fichier est
-  arbitré individuellement (local via Ollama si sensible, externe sinon),
-  au lieu d'un choix de backend global figé.
+  arbitré individuellement (local via Ollama si sensible, externe sinon).
 - **Labels de confiance** `EXTRACTED` / `INFERRED` / `AMBIGUOUS` sur chaque relation.
-- **Résolution cross-modale** : les mentions de symboles de code (entre backticks)
-  dans la documentation sont automatiquement reliées au nœud de code réel.
-- **Résolution cross-fichier** : un appel `Account.find_by_email()` dans un
-  fichier est relié à la vraie définition dans un autre fichier — y compris
-  les appels de méthode (`objet.methode()`), pas seulement les appels directs —
-  avec une garde anti-ambiguïté (un nom qui correspond à plusieurs définitions
-  n'est jamais résolu au hasard).
-- **Résolution des collisions d'identifiants** : deux fichiers différents dont
-  les chemins produiraient accidentellement le même identifiant (ex :
-  `auth/login.py` et `auth_login.py`) sont automatiquement différenciés
-  (salage par hash du chemin d'origine), sans jamais fusionner deux entités
-  distinctes par erreur.
-- **Clustering par l'algorithme de Leiden** (comme Microsoft GraphRAG et
-  graphify), avec repli automatique sur la modularité gloutonne de NetworkX
-  si `python-igraph`/`leidenalg` ne sont pas installés — jamais d'erreur bloquante.
-- **Requête par propagation de score (PPR)** : comme HippoRAG2, la requête
-  identifie les nœuds-graines mentionnés dans la question, puis propage un
-  score de pertinence à travers tout le graphe via l'algorithme Personalized
-  PageRank (`nx.pagerank`) — un score continu qui décroît naturellement avec
-  la distance, plutôt qu'une traversée en largeur (BFS) à profondeur fixe.
-- **Génération réelle de légendes d'image** : les images sont envoyées à un
-  modèle de vision (Claude, GPT-4o, Llama vision via Groq, ou LLaVA en local
-  via Ollama) selon le backend arbitré par `security.py` ; la légende obtenue
-  est ensuite reliée aux symboles de code déjà connus si elle les mentionne
-  (même principe de liaison cross-modale que pour la documentation texte).
-- **Cache d'extraction incrémental** (`cache.py`) : ajouter un nouveau fichier
-  (code, document, PDF, image ou vidéo) à un projet déjà construit ne
-  déclenche PAS une ré-extraction de tout le projet — seuls les fichiers
-  nouveaux ou modifiés (détectés par empreinte de contenu, pas par date) sont
-  réellement traités ; les autres sont réutilisés depuis le cache
-  (`<out_dir>/.graphmind-cache.json`). Nuance importante : c'est
-  l'**extraction** qui est incrémentale (la partie coûteuse en tokens pour
-  PDF/images/vidéo), pas le graphe lui-même — `graph.json`/`graph.html`/
-  `REPORT.md` sont toujours entièrement reconstruits à chaque `build`, à
-  partir de résultats en partie recyclés, en partie neufs. Ce recalcul du
-  graphe est gratuit en tokens (aucun LLM) donc ce n'est pas un problème
-  pratique, mais ce n'est pas un simple ajout de nœuds au fichier existant.
-- **Séparation stricte indexation / requête** : `query.py` ne renvoie jamais le
-  graphe complet, seulement un sous-graphe ciblé (les nœuds les mieux classés
-  après propagation PPR).
-- **Réponse en langage naturel** : la requête ne renvoie jamais de JSON brut —
-  une vraie phrase est générée par le LLM configuré (Anthropic, OpenAI, Groq,
-  Ollama), ou un résumé déterministe si aucun backend n'est disponible.
+- **MultiDiGraph** : plusieurs relations distinctes entre les deux mêmes nœuds
+  (ex: `imports_from` ET `calls`) sont toutes préservées — un simple `DiGraph`
+  aurait silencieusement écrasé l'une par l'autre.
+- **Pondération par confiance** (`graph_utils.py`) : le graphe est "aplati" en
+  simple/non-orienté pour le clustering et la requête, chaque arête pondérée
+  selon la fiabilité des relations qu'elle regroupe (EXTRACTED > INFERRED > AMBIGUOUS).
+- **Clustering hiérarchique à 2 niveaux** (`community` fin + `community_group`
+  large) via l'algorithme de Leiden pondéré, avec repli automatique sur la
+  modularité gloutonne de NetworkX si `python-igraph`/`leidenalg` sont absents.
+- **Nommage sémantique des communautés** : un appel LLM par communauté (pas
+  par fichier) génère un nom descriptif ("Account Auth Flow"), avec repli
+  sur le nom mécanique (nœud le plus connecté) si aucun backend disponible.
+- **Résolution cross-fichier** : appels directs ET appels de méthode
+  (`objet.methode()`), avec garde anti-ambiguïté (un nom qui correspond à
+  plusieurs définitions n'est jamais résolu au hasard).
+- **Résolution des collisions d'identifiants** : deux fichiers différents
+  dont les chemins produiraient accidentellement le même identifiant sont
+  automatiquement différenciés (salage par hash du chemin d'origine).
+- **Résolution cross-modale** : mentions de symboles de code dans la
+  documentation (backticks), et surtout **lecture visuelle de code affiché**
+  dans une image ou une vidéo (capture d'écran) — un vrai nœud de fonction
+  est créé avec ses relations réelles, pas une simple légende en prose.
+- **Vidéo à deux sources indépendantes** : transcription audio locale
+  (faster-whisper) ET extraction d'images clés (PyAV) pour lire du contenu
+  visuel même sans narration.
+- **Requête par Personalized PageRank** (comme HippoRAG2), restreinte aux
+  composantes connexes contenant les graines — évite qu'un résidu numérique
+  de nœuds sans rapport ne pollue la réponse (bug rencontré et corrigé).
+- **Réponse en langage naturel**, jamais de JSON brut — génération via LLM
+  ou résumé déterministe si aucun backend.
+- **Cache d'extraction incrémental** (`cache.py`) : seuls les fichiers
+  nouveaux ou modifiés sont réellement (re)traités. Un échec d'extraction
+  n'est **jamais** mis en cache — une correction de bug ou une clé enfin
+  valide permet une nouvelle tentative automatique au prochain `build`.
+- **Construction et clustering découplés** (`build --no-cluster` +
+  `graphmind cluster` séparée) : sur un gros projet, on peut mettre à jour
+  le graphe rapidement sans payer à chaque fois le coût du recalcul complet
+  des communautés (limite structurelle partagée avec graphify lui-même).
+- **Vérification légère** (`graphmind status`) : dit en un instant si une
+  reconstruction est nécessaire, sans rien extraire.
 - **Intégration aux assistants IA** : skills prêts à l'emploi pour Claude Code
-  et Blackbox AI (voir `.claude/skills/` et `.blackbox/skills/`), avec des
-  garde-fous explicites contre la lecture directe du graphe ou des fichiers
-  sources par l'assistant.
+  et Blackbox AI, avec garde-fous contre la lecture directe du graphe/des
+  fichiers sources, et une limite de reformulations avant d'admettre
+  qu'une fonctionnalité n'existe pas dans le code analysé.
 
 ## Installation
 
@@ -71,13 +67,9 @@ et à l'étude de cas pratique du projet open-source `graphify`.
 pip install -r requirements.txt
 ```
 
-Le clustering Leiden et la transcription vidéo sont des dépendances listées
-dans `requirements.txt` — si l'installation d'un paquet compilé pose souci
-sur ta machine, le programme continue de fonctionner avec un repli automatique
-(modularité gloutonne pour le clustering, pas de transcription pour la vidéo).
-
 Optionnel selon les besoins :
 ```bash
+pip install faster-whisper   # transcription audio + extraction de frames vidéo (installe aussi 'av')
 pip install anthropic        # backend LLM externe (Claude)
 pip install openai           # backend LLM externe (GPT)
 # Groq ne nécessite AUCUN paquet supplémentaire (requête HTTP directe)
@@ -85,29 +77,46 @@ pip install openai           # backend LLM externe (GPT)
 
 ## Configuration des clés (fichier .env recommandé)
 
-Plutôt que de redéfinir une variable d'environnement à chaque session,
-crée un fichier `.env` à la racine du projet (jamais versionné, voir
+Crée un fichier `.env` à la racine du projet (jamais versionné, voir
 `.gitignore`) :
 
 ```
 GROQ_API_KEY=ta_cle_groq
 ```
 
-`graphmind` le charge automatiquement au démarrage (`envfile.py`), avant
-toute autre logique — peu importe quel outil lance la commande (terminal
-manuel, Claude Code, Blackbox AI...).
+Chargé automatiquement au démarrage (`envfile.py`), avant toute autre
+logique — peu importe quel outil lance la commande (terminal manuel,
+Claude Code, Blackbox AI...).
 
-Backends disponibles, par ordre de priorité si plusieurs sont configurés
-en même temps : `ANTHROPIC_API_KEY` > `OPENAI_API_KEY` > `GROQ_API_KEY` >
+Backends disponibles, par ordre de priorité si plusieurs sont configurés en
+même temps : `ANTHROPIC_API_KEY` > `OPENAI_API_KEY` > `GROQ_API_KEY` >
 `GRAPHMIND_OLLAMA_MODEL`. Sans aucune variable définie, l'extraction
 sémantique des fichiers non-code est simplement ignorée — jamais d'erreur
-bloquante, comme pour un corpus 100% code.
+bloquante.
+
+⚠️ Le catalogue de modèles Groq change fréquemment (plusieurs dépréciations
+rencontrées pendant le développement) — si un modèle cesse de fonctionner,
+vérifier la liste actuelle via :
+```powershell
+Invoke-WebRequest -Uri "https://api.groq.com/openai/v1/models" -Headers @{Authorization = "Bearer $env:GROQ_API_KEY"}
+```
 
 ## Usage
 
-Construire le graphe :
+Construire le graphe (avec clustering complet) :
 ```bash
 python -m graphmind.cli build ./mon-projet --out ./mon-projet-graphmind-out
+```
+
+Construction rapide sans clustering (gros projet, mise à jour fréquente) :
+```bash
+python -m graphmind.cli build ./mon-projet --out ./mon-projet-graphmind-out --no-cluster
+python -m graphmind.cli cluster --out ./mon-projet-graphmind-out   # à relancer ponctuellement
+```
+
+Vérifier si une reconstruction est nécessaire, sans rien extraire :
+```bash
+python -m graphmind.cli status ./mon-projet --out ./mon-projet-graphmind-out
 ```
 
 Interroger le graphe déjà construit (réponse en langage naturel) :
@@ -117,55 +126,73 @@ python -m graphmind.cli query "comment fonctionne le login ?" --out ./mon-projet
 
 ## Intégration à un assistant IA (Claude Code / Blackbox AI)
 
-Deux dossiers de "skill" sont fournis à la racine du projet :
+Deux dossiers de "skill" sont fournis (livrés séparément) :
 - `.claude/skills/graphmind/SKILL.md` — pour Claude Code
 - `.blackbox/skills/graphmind/SKILL.md` — pour Blackbox AI (extension VS Code)
 
-Une fois copiés à la racine de ton espace de travail, l'assistant répond aux
-questions sur l'architecture du code en interrogeant le graphe déjà construit
-(`graphmind query`), au lieu de relire l'intégralité des fichiers sources à
-chaque question — avec des garde-fous explicites contre la lecture directe
-de `graph.json` ou des sources, et une limite de reformulations avant de
-signaler clairement qu'une fonctionnalité n'existe pas dans le code analysé.
+Une fois copiés à la racine de l'espace de travail, l'assistant répond aux
+questions sur l'architecture du code en interrogeant le graphe déjà
+construit, au lieu de relire l'intégralité des fichiers sources — avec un
+garde-fou explicite contre la lecture directe de `graph.json` et une limite
+de reformulations avant de signaler clairement qu'une fonctionnalité
+n'existe pas dans le code analysé.
 
 ## Périmètre de ce MVP (limitations assumées)
 
-- Extraction AST : **Python uniquement** pour l'instant. `detect.py` reconnaît
-  déjà les extensions JS/TS (elles apparaissent dans les logs comme "pas
-  encore supporté"), mais l'extracteur réel reste à écrire, sur le modèle de
-  `extractors/code_python.py`. PHP et les autres langages ne sont pas encore
-  reconnus du tout (à ajouter d'abord dans `detect.py`, puis un extracteur dédié).
-- La génération de légende d'image nécessite un modèle réellement capable de
-  vision (tous les modèles ne le sont pas) — vérifier que le modèle configuré
-  supporte la vision avant d'attendre un résultat.
+- Extraction AST : **Python uniquement**. `detect.py` reconnaît déjà les
+  extensions JS/TS (affichées comme "pas encore supporté" dans les logs),
+  mais l'extracteur réel reste à écrire, sur le modèle de `code_python.py`.
+  PHP et les autres langages ne sont pas encore reconnus du tout.
+- La génération de légende/extraction d'image nécessite un modèle
+  réellement capable de vision (tous les modèles ne le sont pas, et le
+  catalogue change souvent chez certains fournisseurs).
+- Le clustering (Leiden comme la modularité gloutonne) reste un **recalcul
+  complet à chaque fois** — pas de mise à jour incrémentale des
+  communautés. Limite structurelle partagée avec graphify lui-même (son
+  propre journal affiche "Re-clustering..." à chaque mise à jour).
+- La liaison cross-modale entre un document texte et le code repose sur une
+  correspondance de nom exacte (backticks ou extraction LLM) — pas de
+  similarité sémantique approximative (embeddings), pour ne jamais créer de
+  lien hasardeux.
 
 ## Structure du projet
 
 ```
 graphmind/
-├── schema.py       # Node, Edge, Confidence, Modality — le format universel
-├── ids.py          # génération d'identifiants stables (clé fichier+symbole)
-├── security.py     # arbitrage local/externe par fichier
-├── envfile.py      # chargement du fichier .env
-├── cache.py        # cache d'extraction (empreinte de contenu) — évite de
-│                     ré-extraire un fichier inchangé à chaque build
-├── llm.py          # interface LLM unifiée (Anthropic/OpenAI/Groq/Ollama)
-├── detect.py       # détection et classification par modalité
+├── schema.py        # Node, Edge, Confidence, Modality, ExtractionResult
+│                       (avec extraction_incomplete pour le cache)
+├── ids.py            # génération d'identifiants stables (clé fichier+symbole)
+├── security.py       # arbitrage local/externe par fichier
+├── envfile.py         # chargement du fichier .env
+├── cache.py            # cache d'extraction par empreinte de contenu —
+│                          ne met JAMAIS en cache un échec
+├── graph_utils.py       # conversion du graphe multi-relationnel en graphe
+│                           simple pondéré par confiance (clustering + requête)
+├── llm.py                # interface LLM unifiée (Anthropic/OpenAI/Groq/Ollama) :
+│                            extraction sémantique texte/image, description
+│                            d'image, nommage de communautés, réponse finale
+├── detect.py              # détection et classification par modalité
 ├── extractors/
-│   ├── code_python.py   # AST tree-sitter (Python), appels directs + méthodes,
-│   │                       imports résolus vers le vrai fichier, raw_calls
-│   │                       pour la résolution cross-fichier
-│   ├── text_doc.py       # Markdown + liaison cross-modale
-│   ├── pdf_doc.py        # pypdf + extraction sémantique LLM
-│   ├── image.py          # métadonnées + légende générée par un modèle de
-│   │                       vision (Claude/GPT-4o/Groq vision/LLaVA)
-│   └── video.py          # transcription locale (faster-whisper) + LLM
-├── build.py        # assemble tout en un graphe NetworkX + résout les
-│                     collisions d'identifiants entre fichiers différents
-├── cluster.py       # détection de communautés (Leiden, repli gloutonne)
-├── query.py          # requête -> sous-graphe ciblé (Personalized PageRank)
-├── export.py          # graph.json + graph.html (communautés, recherche,
-│                         inspection de nœud) + REPORT.md
-└── cli.py              # orchestration : build / query, résolution
-                          cross-fichier des appels, génération de réponse
+│   ├── code_python.py       # AST tree-sitter : appels directs + méthodes,
+│   │                           imports résolus vers le vrai fichier, raw_calls
+│   ├── text_doc.py           # titres + backticks (EXTRACTED) + extraction
+│   │                            LLM enrichie du texte complet (INFERRED)
+│   ├── pdf_doc.py             # pypdf + extraction sémantique LLM
+│   ├── image.py                # métadonnées + extraction STRUCTURÉE
+│   │                              (entités/relations) via modèle de vision,
+│   │                              capable de lire du code affiché à l'écran
+│   └── video.py                 # transcription audio (faster-whisper) +
+│                                    extraction visuelle de frames (PyAV),
+│                                    deux sources indépendantes
+├── build.py                # assemble en MultiDiGraph + résout les
+│                              collisions d'identifiants entre fichiers
+├── cluster.py                # clustering hiérarchique Leiden pondéré
+│                                (2 niveaux), repli modularité gloutonne
+├── query.py                   # requête -> sous-graphe ciblé (Personalized
+│                                 PageRank, restreint aux composantes connexes)
+├── export.py                   # graph.json + graph.html (communautés
+│                                  nommées, taille de nœud par degré,
+│                                  recherche, inspection) + REPORT.md
+└── cli.py                       # orchestration : build / cluster / status /
+                                    query, résolution cross-fichier, cache
 ```

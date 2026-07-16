@@ -78,7 +78,18 @@ def get_cached_result(cache: dict, path: Path, relative_path: str) -> Extraction
 def store_result(cache: dict, path: Path, relative_path: str, result: ExtractionResult) -> None:
     """Enregistre le résultat d'extraction d'un fichier, avec l'empreinte de
     son contenu actuel, pour une réutilisation lors du prochain `build`.
-    to_dict() convertit déjà les enums en texte — rien à faire de plus ici."""
+    to_dict() convertit déjà les enums en texte — rien à faire de plus ici.
+
+    IMPORTANT : si result.extraction_incomplete est True (échec du backend,
+    aucun backend disponible...), on N'ENREGISTRE RIEN dans le cache — sinon
+    un échec ponctuel (clé invalide, modèle temporairement indisponible,
+    bug depuis corrigé...) resterait bloqué indéfiniment, puisque le fichier
+    source lui-même n'a pas changé et continuerait à "matcher" le cache à
+    chaque build futur, empêchant toute nouvelle tentative.
+    """
+    if result.extraction_incomplete:
+        cache.pop(relative_path, None)  # retire aussi une éventuelle ancienne entrée réussie périmée
+        return
     cache[relative_path] = {
         "hash": _file_hash(path),
         "result": {
@@ -96,3 +107,38 @@ def prune_deleted_files(cache: dict, current_relative_paths: set[str]) -> None:
     for relative_path in list(cache.keys()):
         if relative_path not in current_relative_paths:
             del cache[relative_path]
+
+
+def check_status(cache: dict, files: list[tuple[Path, str]]) -> dict:
+    """Vérifie SANS RIEN EXTRAIRE si le projet a changé depuis le dernier
+    build — juste des empreintes de fichiers, quasi instantané et gratuit.
+
+    files : liste de (chemin_absolu, chemin_relatif) pour chaque fichier
+    actuellement détecté dans le projet.
+
+    Sert à décider si `graphmind build` vaut la peine d'être relancé, sans
+    même lancer le pipeline complet pour le découvrir — utile pour un
+    assistant IA qui orchestre plusieurs commandes et veut éviter tout
+    travail (et donc tout coût, y compris son propre coût de raisonnement)
+    inutile.
+    """
+    new_files, changed_files, unchanged_files = [], [], []
+    for abs_path, rel_path in files:
+        entry = cache.get(rel_path)
+        if entry is None:
+            new_files.append(rel_path)
+        elif entry.get("hash") != _file_hash(abs_path):
+            changed_files.append(rel_path)
+        else:
+            unchanged_files.append(rel_path)
+
+    current_rel_paths = {rel for _, rel in files}
+    deleted_files = [rel for rel in cache if rel not in current_rel_paths]
+
+    return {
+        "new": new_files,
+        "changed": changed_files,
+        "unchanged": unchanged_files,
+        "deleted": deleted_files,
+        "needs_rebuild": bool(new_files or changed_files or deleted_files),
+    }

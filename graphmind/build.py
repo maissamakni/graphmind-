@@ -67,10 +67,21 @@ def _disambiguate_colliding_ids(results: list[ExtractionResult]) -> None:
                 edge.target = remap[tgt_key]
 
 
-def build_graph(results: list[ExtractionResult]) -> nx.DiGraph:
+def build_graph(results: list[ExtractionResult]) -> nx.MultiDiGraph:
+    """Construit le graphe final à partir de tous les résultats d'extraction.
+
+    Utilise un MultiDiGraph, pas un simple DiGraph : avec un DiGraph,
+    G.add_edge(u, v, ...) appelé deux fois avec des attributs DIFFÉRENTS
+    (ex: "imports_from" puis "calls" entre les deux mêmes fichiers) écrase
+    silencieusement la première relation — un vrai bug de perte de données.
+    MultiDiGraph garde les deux comme deux arêtes parallèles distinctes,
+    chacune avec sa propre relation/confiance — cohérent avec la façon dont
+    graphify lui-même gère ce cas (cf. edge_data()/edge_datas() dans son
+    code, qui tolèrent explicitement les arêtes parallèles).
+    """
     _disambiguate_colliding_ids(results)
 
-    graph = nx.DiGraph()
+    graph = nx.MultiDiGraph()
 
     for result in results:
         for node in result.nodes:

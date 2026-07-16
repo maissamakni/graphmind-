@@ -8,6 +8,8 @@ Pillow
 python-igraph>=0.11
 leidenalg>=0.10
 # Optionnels (installer selon besoin réel) :
-# faster-whisper      # transcription vidéo/audio locale
+# faster-whisper      # transcription audio locale des vidéos (~150 Mo, modèle "small")
+# av                  # extraction d'images clés des vidéos (déjà installé
+#                       automatiquement comme dépendance de faster-whisper)
 # anthropic           # backend LLM externe
 # openai              # backend LLM externe
