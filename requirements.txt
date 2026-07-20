@@ -7,9 +7,30 @@ Pillow
 # repli automatique sur la modularité gloutonne de NetworkX, sans erreur :
 python-igraph>=0.11
 leidenalg>=0.10
-# Optionnels (installer selon besoin réel) :
+# Extraction de code multi-langages — optionnelles, installer seulement
+# les langages réellement présents dans le(s) projet(s) analysé(s).
+# Sans le paquet correspondant, ces fichiers sont détectés mais leur
+# extraction échoue proprement (jamais mise en cache, retentée
+# automatiquement dès installation du paquet manquant) :
+# tree-sitter-javascript   # JavaScript (.js) ET React JSX (.jsx)
+# tree-sitter-typescript   # TypeScript (.ts) ET React TSX (.tsx)
+# tree-sitter-java         # Java (.java)
+# tree-sitter-c            # C (.c, .h)
+# tree-sitter-cpp          # C++ (.cpp, .cc, .cxx, .hpp)
+# tree-sitter-c-sharp      # C#/.NET (.cs)
+# tree-sitter-go           # Go (.go)
+# tree-sitter-rust         # Rust (.rs)
+# tree-sitter-php          # PHP (.php)
+# tree-sitter-kotlin       # Kotlin (.kt, .kts)
+# tree-sitter-swift        # Swift (.swift)
+# tree-sitter-dart         # Dart (.dart) — extraction des appels non
+#                            couverte dans ce MVP (limite documentée)
+# tree-sitter-sql          # SQL (.sql) — fonctions/procédures stockées
+# tree-sitter-scala        # Scala (.scala)
+# tree-sitter-powershell   # PowerShell (.ps1, .psm1)
 # faster-whisper      # transcription audio locale des vidéos (~150 Mo, modèle "small")
 # av                  # extraction d'images clés des vidéos (déjà installé
 #                       automatiquement comme dépendance de faster-whisper)
-# anthropic           # backend LLM externe
-# openai              # backend LLM externe
+# anthropic           # backend LLM externe (Claude)
+# openai              # backend LLM externe (GPT)
+# pytest              # tests automatisés (dossier tests/) — dépendance de développement uniquement

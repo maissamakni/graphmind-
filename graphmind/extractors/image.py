@@ -1,26 +1,16 @@
 """Extraction pour images.
 
-Deux étapes bien séparées, exactement comme pour pdf_doc.py et text_doc.py :
-1. Lecture des métadonnées de base (Pillow) — mécanique, gratuite, aucun LLM.
-2. Extraction STRUCTURÉE (entités + relations) via un modèle de VISION —
-   pas une simple légende en prose : si l'image contient du code (capture
-   d'écran), le modèle est explicitement invité à le LIRE et à en extraire
-   les vraies fonctions/relations, exactement comme graphify le fait
-   (observé concrètement : une capture d'écran de code Python affichant
-   process_payment() -> charge()/generate_invoice() produit un vrai nœud
-   process_payment relié par des relations "calls" aux fonctions réelles).
-
-Les entités extraites sont ensuite reliées aux symboles de code déjà connus
-par correspondance de nom exacte (même principe que text_doc.py), sans
-jamais créer de nœud fantôme pour un nom non reconnu.
-"""
+Extraction STRUCTURÉE (entités + relations) via un modèle de vision — pas
+une simple légende : si l'image contient du code (capture d'écran), le
+modèle est invité à le LIRE et en extraire les vraies fonctions/relations.
+Liaison cross-modale à trois niveaux (exact, fuzzy, sémantique groupé)."""
 from __future__ import annotations
 
 import re
 from pathlib import Path
 
 from .. import llm
-from ..ids import make_id
+from ..ids import fuzzy_find_symbol, make_id
 from ..schema import Confidence, Edge, ExtractionResult, Modality, Node
 
 _MEDIA_TYPES = {
@@ -36,7 +26,6 @@ def extract_image(
     result = ExtractionResult()
     file_id = make_id(relative_path)
 
-    # Étape 1 — métadonnées de base (jamais de LLM à ce stade)
     metadata: dict = {}
     try:
         from PIL import Image
@@ -46,7 +35,6 @@ def extract_image(
         pass
     result.nodes.append(Node(file_id, path.name, Modality.IMAGE, relative_path, None, metadata=metadata))
 
-    # Étape 2 — extraction structurée via modèle de vision (arbitrée par sécurité)
     backend = llm.resolve_backend(force_local)
     if backend.name == "none":
         result.nodes.append(Node(
@@ -66,11 +54,6 @@ def extract_image(
     semantic = llm.extract_semantic_from_image(image_bytes, media_type, backend)
     entities = semantic.get("entities", [])
     if not entities:
-        # L'appel a échoué ou n'a rien trouvé (déjà journalisé côté llm.py
-        # en cas d'échec réel) — on ne bloque jamais le pipeline, mais on
-        # NE MET JAMAIS CE RÉSULTAT EN CACHE : un échec temporaire (clé
-        # invalide, modèle indisponible...) ne doit pas rester bloqué
-        # indéfiniment après correction du problème.
         result.nodes.append(Node(
             make_id(relative_path, "extraction_failed"),
             f"[aucune entité extraite via {backend.name} — voir les avertissements]",
@@ -79,9 +62,10 @@ def extract_image(
         result.extraction_incomplete = True
         return result
 
-    confidence = Confidence.INFERRED  # une extraction de VLM est une interprétation, jamais une certitude
+    confidence = Confidence.INFERRED
     entity_ids: dict[str, str] = {}
     seen_refs: set[str] = set()
+    pending_semantic: list[tuple[str, str]] = []
 
     for entity in entities:
         name = entity.get("name")
@@ -95,10 +79,6 @@ def extract_image(
         ))
         result.edges.append(Edge(file_id, ent_id, "illustrates", confidence, relative_path))
 
-        # Liaison cross-modale : si l'entité extraite CORRESPOND EXACTEMENT à
-        # un symbole de code déjà connu (ex: "charge" existe vraiment dans
-        # stripe_adapter.py), on relie l'entité au VRAI nœud de code —
-        # jamais un nœud fantôme pour un nom inventé ou non reconnu.
         target_id = known_code_symbols.get(name)
         if target_id is not None and target_id not in seen_refs:
             seen_refs.add(target_id)
@@ -106,11 +86,32 @@ def extract_image(
                 ent_id, target_id, "references", confidence,
                 relative_path, context="vision_exact_match",
             ))
+        elif target_id is None:
+            fuzzy_target_id = fuzzy_find_symbol(name, known_code_symbols)
+            if fuzzy_target_id is not None and fuzzy_target_id not in seen_refs:
+                seen_refs.add(fuzzy_target_id)
+                result.edges.append(Edge(
+                    ent_id, fuzzy_target_id, "references", Confidence.AMBIGUOUS,
+                    relative_path, context="vision_fuzzy_match",
+                ))
+            elif known_code_symbols:
+                pending_semantic.append((ent_id, name))
 
-    # Relations entre entités extraites (ex: process_payment --calls--> charge)
-    # — si une des deux extrémités correspond à un symbole de code déjà
-    # connu, on relie DIRECTEMENT vers le vrai nœud plutôt que vers le
-    # concept image, pour que la relation soit exploitable par la requête.
+    if pending_semantic:
+        names_to_resolve = [name for _, name in pending_semantic]
+        resolved = llm.semantic_link_batch(names_to_resolve, list(known_code_symbols.keys()), backend)
+        for ent_id, name in pending_semantic:
+            symbol = resolved.get(name)
+            if symbol is None:
+                continue
+            target_id = known_code_symbols[symbol]
+            if target_id not in seen_refs:
+                seen_refs.add(target_id)
+                result.edges.append(Edge(
+                    ent_id, target_id, "references", Confidence.AMBIGUOUS,
+                    relative_path, context="vision_semantic_llm_link_batch",
+                ))
+
     for rel in semantic.get("relations", []):
         src_name, tgt_name = rel.get("source"), rel.get("target")
         if not src_name or not tgt_name:

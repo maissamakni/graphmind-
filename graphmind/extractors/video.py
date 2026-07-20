@@ -1,18 +1,5 @@
-"""Extraction pour vidéo.
-
-Deux sources de contenu, complémentaires et indépendantes :
-1. Transcription AUDIO 100% locale via faster-whisper — pour une vidéo avec
-   narration. Aucun backend externe nécessaire à cette étape.
-2. Extraction VISUELLE via quelques images clés extraites de la vidéo (PyAV,
-   déjà une dépendance de faster-whisper) — pour une vidéo SANS narration
-   qui montre néanmoins du contenu utile à l'écran (ex: une capture d'écran
-   silencieuse montrant du code), en réutilisant exactement le même
-   mécanisme de lecture structurée que pour une image fixe (image.py).
-
-Les deux sources sont tentées indépendamment : une vidéo peut n'avoir que
-de la parole, que du contenu visuel, les deux, ou ni l'un ni l'autre — dans
-ce dernier cas seulement, on considère l'extraction incomplète.
-"""
+"""Extraction pour vidéo — deux sources indépendantes : transcription
+audio locale (faster-whisper) et extraction visuelle de frames (PyAV)."""
 from __future__ import annotations
 
 import io
@@ -23,38 +10,31 @@ from pathlib import Path
 from .. import llm
 from ..ids import make_id
 from ..schema import Confidence, Edge, ExtractionResult, Modality, Node
+from ..logging_config import get_logger
+
+log = get_logger()
 
 
 def _transcribe_local(path: Path) -> list[dict] | None:
-    """Retourne une liste de segments {"start": float, "end": float, "text": str}.
-
-    Distinction importante entre DEUX cas bien différents :
-    - Retourne None si faster-whisper est absent OU si la transcription a
-      RÉELLEMENT échoué (exception) — un vrai problème à signaler.
-    - Retourne une liste VIDE [] si faster-whisper a fonctionné correctement
-      mais n'a trouvé aucune parole dans la vidéo (silencieuse, musique
-      seule, ou contenu purement visuel comme du code affiché) — un
-      résultat légitime, PAS une erreur.
-    """
+    """Retourne None si faster-whisper absent OU échec réel ; liste vide si
+    transcription réussie mais aucune parole trouvée (deux cas distincts)."""
     try:
         from faster_whisper import WhisperModel
     except ImportError:
-        print("[graphmind] avertissement : faster-whisper non installé — transcription vidéo ignorée.", file=sys.stderr)
+        log.warning("faster-whisper non installé — transcription vidéo ignorée.")
         return None
     try:
         model = WhisperModel("small", device="cpu", compute_type="int8")
         segments, _ = model.transcribe(str(path))
         return [{"start": s.start, "end": s.end, "text": s.text} for s in segments]
     except Exception as exc:
-        print(f"[graphmind] avertissement : échec de la transcription vidéo ({type(exc).__name__}: {exc}).", file=sys.stderr)
+        log.warning(f"échec de la transcription vidéo ({type(exc).__name__}: {exc}).")
         return None
 
 
 def _extract_key_frames(path: Path, max_frames: int = 3) -> list[bytes]:
     """Extrait quelques images (PNG) réparties dans la vidéo, pour une
-    lecture visuelle de son contenu (ex: du code affiché à l'écran, sans
-    narration). Retourne une liste vide si PyAV est absent ou en cas
-    d'échec — jamais d'exception remontée à l'appelant."""
+    lecture visuelle de son contenu."""
     try:
         import av
     except ImportError:
@@ -68,8 +48,6 @@ def _extract_key_frames(path: Path, max_frames: int = 3) -> list[bytes]:
         if duration <= 0:
             return []
 
-        # Répartit les instants choisis sur toute la durée, en évitant le
-        # tout début/la toute fin (souvent un écran vide ou une transition).
         timestamps = [duration * (i + 1) / (max_frames + 1) for i in range(max_frames)]
         for ts in timestamps:
             container.seek(int(ts / stream.time_base), stream=stream)
@@ -77,10 +55,10 @@ def _extract_key_frames(path: Path, max_frames: int = 3) -> list[bytes]:
                 buf = io.BytesIO()
                 frame.to_image().save(buf, format="PNG")
                 frames.append(buf.getvalue())
-                break  # une seule image par instant visé
+                break
     except Exception as exc:
-        print(f"[graphmind] avertissement : échec de l'extraction d'images de la vidéo ({exc}).", file=sys.stderr)
-        return frames  # on garde celles déjà obtenues avant l'échec, s'il y en a
+        log.warning(f"échec de l'extraction d'images de la vidéo ({exc}).")
+        return frames
 
     return frames
 
@@ -126,13 +104,10 @@ def extract_video(
                 ent_id = make_id(relative_path, name)
                 result.nodes.append(Node(ent_id, name, Modality.VIDEO, relative_path))
                 result.edges.append(Edge(file_id, ent_id, "contains", confidence, relative_path))
-    else:
-        pass  # segments == [] : audio traité avec succès mais aucune parole
-              # trouvée — on attend de voir si la source visuelle (frames)
-              # trouve quelque chose avant de conclure quoi que ce soit
-              # (cf. le bloc final, qui gère le cas où RIEN n'a été trouvé).
+    # segments == [] : audio réussi mais aucune parole — pas de placeholder
+    # immédiat, on attend de voir si la source visuelle trouve quelque chose.
 
-    # --- Source 2 : lecture visuelle d'images clés (ex: code affiché) ---
+    # --- Source 2 : lecture visuelle d'images clés ---
     if backend.name != "none":
         frames = _extract_key_frames(path)
         entity_ids: dict[str, str] = {}
@@ -140,12 +115,12 @@ def extract_video(
         seen_relations: set[tuple[str, str, str]] = set()
         confidence = Confidence.INFERRED
 
-        for i, frame_bytes in enumerate(frames):
+        for frame_bytes in frames:
             semantic = llm.extract_semantic_from_image(frame_bytes, "image/png", backend)
             for entity in semantic.get("entities", []):
                 name = entity.get("name")
                 if not name or name in entity_ids:
-                    continue  # déjà vu sur une image précédente de la même vidéo
+                    continue
                 found_anything = True
                 ent_id = make_id(relative_path, "frame_concept", name)
                 entity_ids[name] = ent_id

@@ -10,6 +10,9 @@ __pycache__/
 *-graphmind-out/
 *-out/
 
+# Cache de tests
+.pytest_cache/
+
 # Fichiers spécifiques à l'éditeur / l'OS
 .vscode/
 .idea/

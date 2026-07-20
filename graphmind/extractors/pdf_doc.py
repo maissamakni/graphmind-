@@ -1,11 +1,7 @@
 """Extraction pour fichiers PDF.
 
-Deux étapes bien séparées (cf. discussion sur extract_pdf_text) :
-1. pypdf extrait le texte brut — mécanique, gratuit, aucun LLM.
-2. Le texte est ensuite envoyé à un backend LLM (choisi par security.py)
-   pour en tirer des entités/relations structurées — seule cette étape
-   coûte des tokens et peut être locale ou externe.
-"""
+Deux étapes séparées : pypdf extrait le texte brut (mécanique, gratuit),
+puis le texte est envoyé à un backend LLM pour en tirer entités/relations."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -39,6 +35,7 @@ def extract_pdf(path: Path, relative_path: str, force_local: bool) -> Extraction
     confidence = Confidence.INFERRED if backend.name != "none" else Confidence.AMBIGUOUS
     if semantic.get("_error"):
         result.extraction_incomplete = True
+
     for entity in semantic.get("entities", []):
         name = entity.get("name")
         if not name:

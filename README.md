@@ -12,6 +12,20 @@ et à l'étude de cas pratique du projet open-source `graphify`.
 ## Principes d'architecture
 
 - **AST/tree-sitter pour le code** — aucun appel LLM, confiance `EXTRACTED`.
+  **16 langages** (`extractors/code/`) : Python, JavaScript, TypeScript,
+  React JSX/TSX, Java, C, C++, C#/.NET, Go, Rust, PHP, Kotlin, Swift,
+  Dart, SQL, Scala, PowerShell — via un walker AST générique (`base.py`)
+  paramétré par un `LanguageSpec` par langage (noms de nœuds tree-sitter
+  réels, vérifiés empiriquement en parsant du code réel, jamais devinés).
+  Trois mécanismes optionnels du walker couvrent les structures
+  grammaticales moins courantes découvertes en le faisant : nom de
+  définition personnalisable (Go, C/C++), corps de fonction porté par le
+  nœud frère suivant plutôt que par ses enfants (Dart), "réouverture"
+  d'un type déjà déclaré plutôt que création d'un doublon (`impl Type` en
+  Rust), et rattachement par type récepteur plutôt que par imbrication
+  syntaxique (méthodes Go, déclarées hors du struct). Un nouveau langage
+  s'ajoute par un seul fichier
+  `<langage>_spec.py`, sans toucher au walker.
 - **LLM réservé au contenu non structuré** (PDF, images, vidéo) — jamais pour le code.
 - **Sécurité par fichier, pas par projet** (`security.py`) : chaque fichier est
   arbitré individuellement (local via Ollama si sensible, externe sinon).
@@ -25,41 +39,62 @@ et à l'étude de cas pratique du projet open-source `graphify`.
 - **Clustering hiérarchique à 2 niveaux** (`community` fin + `community_group`
   large) via l'algorithme de Leiden pondéré, avec repli automatique sur la
   modularité gloutonne de NetworkX si `python-igraph`/`leidenalg` sont absents.
+- **Démarrage à chaud du clustering** : si un clustering précédent existe
+  (`graph.json` déjà présent), Leiden repart de cette partition plutôt que
+  de zéro — convergence plus rapide, et surtout des identifiants de
+  communauté **stables** d'un build à l'autre.
+- **Avertissement de taille** (`cluster.LARGE_GRAPH_NODE_THRESHOLD`, 5000
+  nœuds par défaut) : au-delà de ce seuil, un message explicite recommande
+  `build --no-cluster` + `graphmind cluster` ponctuel.
 - **Nommage sémantique des communautés** : un appel LLM par communauté (pas
   par fichier) génère un nom descriptif ("Account Auth Flow"), avec repli
-  sur le nom mécanique (nœud le plus connecté) si aucun backend disponible.
+  sur le nom mécanique si aucun backend disponible. Gestion explicite du
+  429 (rate limit Groq) : nouvelle tentative en respectant `Retry-After`,
+  plus un délai préventif entre appels consécutifs.
 - **Résolution cross-fichier** : appels directs ET appels de méthode
-  (`objet.methode()`), avec garde anti-ambiguïté (un nom qui correspond à
-  plusieurs définitions n'est jamais résolu au hasard).
+  (`objet.methode()`), avec garde anti-ambiguïté — étendue aux **imports**
+  non résolus par le chemin de fichier (`raw_imports`), résolus par
+  correspondance de nom de symbole sur tout le corpus (corrige
+  concrètement PHP/Kotlin/Scala, dont les namespaces ne suivent pas
+  forcément le chemin de fichier).
 - **Résolution des collisions d'identifiants** : deux fichiers différents
   dont les chemins produiraient accidentellement le même identifiant sont
   automatiquement différenciés (salage par hash du chemin d'origine).
-- **Résolution cross-modale** : mentions de symboles de code dans la
-  documentation (backticks), et surtout **lecture visuelle de code affiché**
-  dans une image ou une vidéo (capture d'écran) — un vrai nœud de fonction
-  est créé avec ses relations réelles, pas une simple légende en prose.
+- **Résolution cross-modale à trois niveaux, du plus certain au plus coûteux** :
+  1. **Exacte** (backticks, extraction LLM, lecture visuelle de code affiché)
+     — un vrai nœud de fonction est créé avec ses relations réelles.
+  2. **Approximative** (`ids.fuzzy_find_symbol`, sans dépendance
+     supplémentaire) : rattrape les fautes de frappe (ex: "email_service"
+     mentionné alors que le vrai fichier est "email_sercice") — `AMBIGUOUS`.
+  3. **Sémantique en dernier recours, GROUPÉE** (`llm.semantic_link_batch`) :
+     un appel LLM regroupant TOUS les concepts non résolus d'un même
+     fichier (pas un appel par concept) demande une correspondance PAR LE
+     SENS (ex: "paiement" ↔ "billing") — le nom retourné doit correspondre
+     EXACTEMENT à un symbole réel, sinon rejeté ; `AMBIGUOUS`.
 - **Vidéo à deux sources indépendantes** : transcription audio locale
   (faster-whisper) ET extraction d'images clés (PyAV) pour lire du contenu
   visuel même sans narration.
 - **Requête par Personalized PageRank** (comme HippoRAG2), restreinte aux
   composantes connexes contenant les graines — évite qu'un résidu numérique
-  de nœuds sans rapport ne pollue la réponse (bug rencontré et corrigé).
-- **Réponse en langage naturel**, jamais de JSON brut — génération via LLM
-  ou résumé déterministe si aucun backend.
+  de nœuds sans rapport ne pollue la réponse.
+- **Réponse hiérarchique** : `_build_context()` organise la réponse en deux
+  sections explicites — "faits de code certains" et "contexte documentaire
+  associé" — exploitant la hiérarchie document/image/vidéo → concept →
+  code déjà présente dans le graphe, plutôt qu'une liste plate.
 - **Cache d'extraction incrémental** (`cache.py`) : seuls les fichiers
   nouveaux ou modifiés sont réellement (re)traités. Un échec d'extraction
-  n'est **jamais** mis en cache — une correction de bug ou une clé enfin
-  valide permet une nouvelle tentative automatique au prochain `build`.
+  n'est **jamais** mis en cache.
 - **Construction et clustering découplés** (`build --no-cluster` +
-  `graphmind cluster` séparée) : sur un gros projet, on peut mettre à jour
-  le graphe rapidement sans payer à chaque fois le coût du recalcul complet
-  des communautés (limite structurelle partagée avec graphify lui-même).
-- **Vérification légère** (`graphmind status`) : dit en un instant si une
-  reconstruction est nécessaire, sans rien extraire.
-- **Intégration aux assistants IA** : skills prêts à l'emploi pour Claude Code
-  et Blackbox AI, avec garde-fous contre la lecture directe du graphe/des
-  fichiers sources, et une limite de reformulations avant d'admettre
-  qu'une fonctionnalité n'existe pas dans le code analysé.
+  `graphmind cluster` séparée).
+- **Vérification légère** (`graphmind status`).
+- **Configuration centralisée** (`graphmind.toml` optionnel, `config.py`) :
+  mots-clés sensibles, dossiers ignorés, résolutions de clustering, modèles
+  LLM — personnalisables sans toucher au code (`graphmind init-config`).
+- **Journalisation** (`logging_config.py`) : `stdout` reste toujours pur
+  (uniquement la réponse de `query` ou le JSON de `status`) ; les logs de
+  progression vont sur `stderr`, avec `-v`/`-q`/`GRAPHMIND_LOG_LEVEL`.
+- **Intégration aux assistants IA** : skills pour Claude Code, Blackbox AI
+  et GitHub Copilot, avec garde-fous contre la lecture directe du graphe.
 
 ## Installation
 
@@ -72,127 +107,113 @@ Optionnel selon les besoins :
 pip install faster-whisper   # transcription audio + extraction de frames vidéo (installe aussi 'av')
 pip install anthropic        # backend LLM externe (Claude)
 pip install openai           # backend LLM externe (GPT)
+pip install pytest           # tests automatisés
 # Groq ne nécessite AUCUN paquet supplémentaire (requête HTTP directe)
 ```
 
 ## Configuration des clés (fichier .env recommandé)
 
-Crée un fichier `.env` à la racine du projet (jamais versionné, voir
-`.gitignore`) :
-
+Crée un fichier `.env` à la racine du projet (jamais versionné) :
 ```
 GROQ_API_KEY=ta_cle_groq
 ```
+Chargé automatiquement au démarrage, avant toute autre logique. Ordre de
+priorité si plusieurs backends configurés : `ANTHROPIC_API_KEY` >
+`OPENAI_API_KEY` > `GROQ_API_KEY` > `GRAPHMIND_OLLAMA_MODEL`.
 
-Chargé automatiquement au démarrage (`envfile.py`), avant toute autre
-logique — peu importe quel outil lance la commande (terminal manuel,
-Claude Code, Blackbox AI...).
-
-Backends disponibles, par ordre de priorité si plusieurs sont configurés en
-même temps : `ANTHROPIC_API_KEY` > `OPENAI_API_KEY` > `GROQ_API_KEY` >
-`GRAPHMIND_OLLAMA_MODEL`. Sans aucune variable définie, l'extraction
-sémantique des fichiers non-code est simplement ignorée — jamais d'erreur
-bloquante.
-
-⚠️ Le catalogue de modèles Groq change fréquemment (plusieurs dépréciations
-rencontrées pendant le développement) — si un modèle cesse de fonctionner,
-vérifier la liste actuelle via :
+⚠️ Le catalogue de modèles Groq change fréquemment — vérifier la liste
+actuelle via :
 ```powershell
 Invoke-WebRequest -Uri "https://api.groq.com/openai/v1/models" -Headers @{Authorization = "Bearer $env:GROQ_API_KEY"}
 ```
 
 ## Usage
 
-Construire le graphe (avec clustering complet) :
 ```bash
+# Construire le graphe (avec clustering complet)
 python -m graphmind.cli build ./mon-projet --out ./mon-projet-graphmind-out
-```
 
-Construction rapide sans clustering (gros projet, mise à jour fréquente) :
-```bash
+# Construction rapide sans clustering (gros projet, mise à jour fréquente)
 python -m graphmind.cli build ./mon-projet --out ./mon-projet-graphmind-out --no-cluster
-python -m graphmind.cli cluster --out ./mon-projet-graphmind-out   # à relancer ponctuellement
-```
+python -m graphmind.cli cluster --out ./mon-projet-graphmind-out
 
-Vérifier si une reconstruction est nécessaire, sans rien extraire :
-```bash
+# Vérifier si une reconstruction est nécessaire, sans rien extraire
 python -m graphmind.cli status ./mon-projet --out ./mon-projet-graphmind-out
-```
 
-Interroger le graphe déjà construit (réponse en langage naturel) :
-```bash
+# Interroger le graphe déjà construit
 python -m graphmind.cli query "comment fonctionne le login ?" --out ./mon-projet-graphmind-out
+
+# Générer un exemple de configuration
+python -m graphmind.cli init-config ./mon-projet
+
+# Verbosité
+python -m graphmind.cli -v build ...   # verbeux (DEBUG)
+python -m graphmind.cli -q build ...   # silencieux (WARNING/ERROR)
 ```
 
-## Intégration à un assistant IA (Claude Code / Blackbox AI)
+## Tests automatisés
 
-Deux dossiers de "skill" sont fournis (livrés séparément) :
-- `.claude/skills/graphmind/SKILL.md` — pour Claude Code
-- `.blackbox/skills/graphmind/SKILL.md` — pour Blackbox AI (extension VS Code)
+```bash
+pip install pytest
+python -m pytest tests/ -v
+```
+95 tests couvrant en priorité les modules à l'origine des bugs réellement
+rencontrés pendant le développement (résolution des collisions
+d'identifiants, préservation des relations parallèles via MultiDiGraph,
+cache qui ne retient jamais un échec, restriction du PPR aux composantes
+connexes, stabilité du warm start, rejet des hallucinations LLM).
 
-Une fois copiés à la racine de l'espace de travail, l'assistant répond aux
-questions sur l'architecture du code en interrogeant le graphe déjà
-construit, au lieu de relire l'intégralité des fichiers sources — avec un
-garde-fou explicite contre la lecture directe de `graph.json` et une limite
-de reformulations avant de signaler clairement qu'une fonctionnalité
-n'existe pas dans le code analysé.
+## Intégration à un assistant IA (Claude Code / Blackbox AI / Copilot)
 
-## Périmètre de ce MVP (limitations assumées)
+Trois skills sont fournis (livrés séparément) :
+- `.claude/skills/graphmind/SKILL.md` — Claude Code
+- `.blackbox/skills/graphmind/SKILL.md` — Blackbox AI
+- `.github/copilot-instructions.md` — GitHub Copilot
 
-- Extraction AST : **Python uniquement**. `detect.py` reconnaît déjà les
-  extensions JS/TS (affichées comme "pas encore supporté" dans les logs),
-  mais l'extracteur réel reste à écrire, sur le modèle de `code_python.py`.
-  PHP et les autres langages ne sont pas encore reconnus du tout.
-- La génération de légende/extraction d'image nécessite un modèle
-  réellement capable de vision (tous les modèles ne le sont pas, et le
-  catalogue change souvent chez certains fournisseurs).
-- Le clustering (Leiden comme la modularité gloutonne) reste un **recalcul
-  complet à chaque fois** — pas de mise à jour incrémentale des
-  communautés. Limite structurelle partagée avec graphify lui-même (son
-  propre journal affiche "Re-clustering..." à chaque mise à jour).
-- La liaison cross-modale entre un document texte et le code repose sur une
-  correspondance de nom exacte (backticks ou extraction LLM) — pas de
-  similarité sémantique approximative (embeddings), pour ne jamais créer de
-  lien hasardeux.
+Une fois copiés à la racine de l'espace de travail ouvert dans l'éditeur
+(vérifier lequel — Claude Code utilise la racine du dépôt Git le plus
+proche, pas nécessairement le dossier ouvert dans l'éditeur), l'assistant
+répond aux questions sur l'architecture en interrogeant le graphe déjà
+construit, avec un garde-fou contre la lecture directe du graphe et une
+limite de reformulations avant d'admettre qu'une fonctionnalité n'existe
+pas dans le code analysé.
+
+
 
 ## Structure du projet
 
 ```
 graphmind/
-├── schema.py        # Node, Edge, Confidence, Modality, ExtractionResult
-│                       (avec extraction_incomplete pour le cache)
-├── ids.py            # génération d'identifiants stables (clé fichier+symbole)
-├── security.py       # arbitrage local/externe par fichier
+├── schema.py          # Node, Edge, Confidence, Modality, ExtractionResult
+├── ids.py             # identifiants stables + fuzzy_find_symbol
+├── security.py        # arbitrage local/externe par fichier
 ├── envfile.py         # chargement du fichier .env
-├── cache.py            # cache d'extraction par empreinte de contenu —
-│                          ne met JAMAIS en cache un échec
-├── graph_utils.py       # conversion du graphe multi-relationnel en graphe
-│                           simple pondéré par confiance (clustering + requête)
-├── llm.py                # interface LLM unifiée (Anthropic/OpenAI/Groq/Ollama) :
-│                            extraction sémantique texte/image, description
-│                            d'image, nommage de communautés, réponse finale
-├── detect.py              # détection et classification par modalité
+├── config.py           # configuration centralisée (graphmind.toml optionnel)
+├── logging_config.py    # journalisation (stdout pur, logs sur stderr)
+├── cache.py              # cache d'extraction — ne met JAMAIS en cache un échec
+├── graph_utils.py         # graphe pondéré par confiance (clustering + requête)
+├── llm.py                  # interface LLM unifiée : extraction texte/image,
+│                              nommage de communautés, semantic_link_batch,
+│                              réponse finale — seul point d'appel IA
+├── detect.py                # détection et classification par modalité
 ├── extractors/
-│   ├── code_python.py       # AST tree-sitter : appels directs + méthodes,
-│   │                           imports résolus vers le vrai fichier, raw_calls
-│   ├── text_doc.py           # titres + backticks (EXTRACTED) + extraction
-│   │                            LLM enrichie du texte complet (INFERRED)
-│   ├── pdf_doc.py             # pypdf + extraction sémantique LLM
-│   ├── image.py                # métadonnées + extraction STRUCTURÉE
-│   │                              (entités/relations) via modèle de vision,
-│   │                              capable de lire du code affiché à l'écran
-│   └── video.py                 # transcription audio (faster-whisper) +
-│                                    extraction visuelle de frames (PyAV),
-│                                    deux sources indépendantes
-├── build.py                # assemble en MultiDiGraph + résout les
-│                              collisions d'identifiants entre fichiers
-├── cluster.py                # clustering hiérarchique Leiden pondéré
-│                                (2 niveaux), repli modularité gloutonne
-├── query.py                   # requête -> sous-graphe ciblé (Personalized
-│                                 PageRank, restreint aux composantes connexes)
-├── export.py                   # graph.json + graph.html (communautés
-│                                  nommées, taille de nœud par degré,
-│                                  recherche, inspection) + REPORT.md
-└── cli.py                       # orchestration : build / cluster / status /
-                                    query, résolution cross-fichier, cache
+│   ├── code/                   # extraction multi-langages (16 langages)
+│   │   ├── base.py                # walker AST générique, paramétré par LanguageSpec
+│   │   ├── python_spec.py          # + java_spec, php_spec, csharp_spec,
+│   │   │                             javascript_spec, typescript_spec, tsx_spec,
+│   │   │                             c_spec, cpp_spec, go_spec, rust_spec,
+│   │   │                             kotlin_spec, swift_spec, dart_spec,
+│   │   │                             sql_spec, scala_spec, powershell_spec
+│   ├── text_doc.py              # titres + backticks + LLM enrichi + batch
+│   ├── pdf_doc.py                 # pypdf + extraction sémantique LLM
+│   ├── image.py                    # extraction structurée via vision + batch
+│   └── video.py                     # audio (faster-whisper) + frames (PyAV)
+├── build.py                    # MultiDiGraph + résolution des collisions
+├── cluster.py                    # clustering hiérarchique Leiden + warm start
+├── query.py                        # PPR restreint aux composantes connexes
+├── export.py                         # graph.json + graph.html + REPORT.md
+└── cli.py                              # build / cluster / status / query /
+                                           init-config, contexte hiérarchique
+
+tests/              # suite pytest (95 tests)
 ```

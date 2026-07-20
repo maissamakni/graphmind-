@@ -1,10 +1,4 @@
-"""Chargement d'un fichier .env — sans dépendance externe (pas de
-python-dotenv), pour rester fidèle au principe d'architecture compacte.
-
-Les variables déjà définies dans l'environnement (ex: via $env:... dans
-PowerShell) sont toujours prioritaires sur celles du fichier .env — le
-fichier ne sert qu'à éviter d'avoir à retaper la clé à chaque session.
-"""
+"""Chargement d'un fichier .env — sans dépendance externe."""
 from __future__ import annotations
 
 import os
@@ -13,8 +7,8 @@ from pathlib import Path
 
 def load_dotenv(start_dir: Path | None = None) -> None:
     """Cherche un fichier .env en remontant depuis start_dir (ou le
-    répertoire courant), et charge ses variables dans os.environ —
-    sans écraser une variable déjà présente."""
+    répertoire courant), et charge ses variables dans os.environ — sans
+    écraser une variable déjà présente."""
     current = Path(start_dir or os.getcwd()).resolve()
     for directory in [current, *current.parents]:
         env_path = directory / ".env"

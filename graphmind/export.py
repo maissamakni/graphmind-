@@ -2,21 +2,17 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import networkx as nx
 
 from . import llm
 
-# Palette cyclique par communauté (assez de couleurs distinctes avant répétition)
 _COMMUNITY_PALETTE = [
     "#4f8ef7", "#f7924f", "#e0554f", "#4fd68c", "#c084f5",
     "#f5d24f", "#4fc4f7", "#f77fb8", "#8cf74f", "#9d7cf7",
 ]
-
-_MODALITY_ICON = {
-    "code": "●", "document": "●", "pdf": "●", "image": "●", "video": "●", "concept": "●",
-}
 
 _HTML_TEMPLATE = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>graphmind</title>
@@ -65,16 +61,11 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 const graphData = {graph_json};
 const communityInfo = {community_json};
 
-const modColors = {{code:"#4f8ef7", document:"#f7924f", pdf:"#e0554f", image:"#4fd68c", video:"#c084f5", concept:"#6a6f7c"}};
-
 function communityColor(c) {{
   if (communityInfo[c]) return communityInfo[c].color;
   return "#888";
 }}
 
-// Taille des nœuds proportionnelle au nombre de connexions (comme les
-// "god nodes" de graphify) — un nœud très connecté (ex: une classe centrale
-// comme "Account") se voit visuellement plus important qu'un nœud isolé.
 const degreeCount = {{}};
 graphData.edges.forEach(e => {{
   degreeCount[e.source] = (degreeCount[e.source] || 0) + 1;
@@ -112,16 +103,13 @@ const network = new vis.Network(document.getElementById("network"), {{nodes, edg
   interaction: {{ hover: true }},
 }});
 
-// --- Panneau d'information sur clic ---
 network.on("click", function (params) {{
   const info = document.getElementById("node-info");
   if (params.nodes.length === 0) {{
     info.innerHTML = "Cliquez un nœud pour l'inspecter";
-    info.classList.add("empty");
     return;
   }}
   const n = nodes.get(params.nodes[0])._raw;
-  info.classList.remove("empty");
   info.innerHTML = `
     <div class="field"><b>Label</b>${{n.label}}</div>
     <div class="field"><b>Modalité</b>${{n.modality}}</div>
@@ -131,7 +119,6 @@ network.on("click", function (params) {{
   `;
 }});
 
-// --- Liste des communautés (sidebar) ---
 const listEl = document.getElementById("community-list");
 const hiddenCommunities = new Set();
 
@@ -184,17 +171,9 @@ document.getElementById("footer").textContent =
 """
 
 
-def _build_community_info(graph: nx.DiGraph) -> dict:
-    """Pour chaque communauté : une couleur stable, un label représentatif
-    et le nombre de nœuds.
-
-    Le label est d'abord tenté via un nommage sémantique par LLM (un seul
-    appel PAR COMMUNAUTÉ, pas par fichier — même principe que le résumé de
-    communauté de Microsoft GraphRAG), à partir des labels des membres les
-    plus connectés. Si aucun backend n'est disponible ou que l'appel échoue,
-    on retombe sur le nom MÉCANIQUE (le nœud le plus connecté du groupe) —
-    jamais d'erreur bloquante, jamais de communauté sans nom.
-    """
+def _build_community_info(graph: nx.MultiDiGraph) -> dict:
+    """Nom sémantique via LLM (1 appel par communauté), repli mécanique
+    (nœud le plus connecté) si aucun backend ou échec."""
     groups: dict[str, list[str]] = {}
     for node_id, data in graph.nodes(data=True):
         cid = str(data.get("community", "0"))
@@ -210,6 +189,8 @@ def _build_community_info(graph: nx.DiGraph) -> dict:
 
         top_labels = [str(graph.nodes[m].get("label", m)) for m in ranked_members[:8]]
         semantic_label = llm.name_community(top_labels, backend) if len(members) > 1 else None
+        if backend.name == "groq" and idx < len(groups) - 1:
+            time.sleep(0.8)  # préventif contre le rate limit Groq
 
         info[cid] = {
             "label": semantic_label or mechanical_label,
@@ -219,7 +200,7 @@ def _build_community_info(graph: nx.DiGraph) -> dict:
     return info
 
 
-def export_graph(graph: nx.DiGraph, out_dir: Path) -> None:
+def export_graph(graph: nx.MultiDiGraph, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     data = nx.node_link_data(graph, edges="edges")
