@@ -1,0 +1,38 @@
+# Dépendances de développement — installe TOUT ce qu'il faut pour que la
+# suite de tests (tests/) s'exécute intégralement, sans qu'aucun test ne
+# soit silencieusement ignoré faute de grammaire tree-sitter installée.
+#
+# Usage :
+#   pip install -r requirements.txt -r requirements-dev.txt
+#   python -m pytest tests/ -v
+#
+# Ce fichier est utilisé par la CI (.github/workflows/tests.yml) — toute
+# dépendance manquante ici ferait passer certains tests en "skipped" au
+# lieu d'être réellement exécutés et vérifiés.
+
+-r requirements.txt
+
+pytest>=8.0
+
+# Les 16 langages : chaque grammaire réellement installée pour que
+# extractors/code/*_spec.py soit testé avec un vrai analyseur, jamais
+# seulement le chemin de repli (extraction_incomplete).
+tree-sitter-javascript
+tree-sitter-typescript
+tree-sitter-java
+tree-sitter-c
+tree-sitter-cpp
+tree-sitter-c-sharp
+tree-sitter-go
+tree-sitter-rust
+tree-sitter-php
+tree-sitter-kotlin
+tree-sitter-swift
+tree-sitter-dart
+tree-sitter-sql
+tree-sitter-scala
+tree-sitter-powershell
+
+# Clustering Leiden réel (pas seulement le repli modularité gloutonne) :
+python-igraph>=0.11
+leidenalg>=0.10

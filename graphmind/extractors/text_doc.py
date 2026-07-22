@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 
 from .. import llm
-from ..ids import fuzzy_find_symbol, make_id
+from ..ids import build_normalized_lookup, fuzzy_find_symbol, make_id, normalize_identifier
 from ..schema import Confidence, Edge, ExtractionResult, Modality, Node
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
@@ -68,6 +68,12 @@ def extract_text_doc(
     semantic = llm.extract_semantic(text, backend)
     entity_ids: dict[str, str] = {}
     pending_semantic: list[tuple[str, str]] = []  # (ent_id, name) à résoudre en bloc
+    # Précalculé une seule fois (pas par entité) : table {forme normalisée
+    # -> target_id}, pour rattraper une différence de CONVENTION de nommage
+    # (camelCase vs snake_case) entre le texte et le vrai symbole de code —
+    # pas une supposition approximative, la même fiabilité qu'une
+    # correspondance exacte (cf. ids.normalize_identifier).
+    normalized_lookup = build_normalized_lookup(known_code_symbols)
 
     for entity in semantic.get("entities", []):
         name = entity.get("name")
@@ -91,6 +97,20 @@ def extract_text_doc(
                     ent_id, target_id, "references", Confidence.INFERRED,
                     relative_path, context="semantic_concept_mention",
                 ))
+
+        if not exact_match_found:
+            # Convention de nommage différente (ex: doc en snake_case,
+            # méthode Java en camelCase) — aussi fiable qu'un exact match,
+            # pas une supposition.
+            for word in words_in_name:
+                normalized_target_id = normalized_lookup.get(normalize_identifier(word))
+                if normalized_target_id is not None and normalized_target_id not in seen_refs:
+                    exact_match_found = True
+                    seen_refs.add(normalized_target_id)
+                    result.edges.append(Edge(
+                        ent_id, normalized_target_id, "references", Confidence.INFERRED,
+                        relative_path, context="normalized_concept_mention",
+                    ))
 
         if not exact_match_found:
             fuzzy_target_id = fuzzy_find_symbol(name, known_code_symbols)

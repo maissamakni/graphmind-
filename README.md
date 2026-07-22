@@ -76,11 +76,25 @@ et à l'étude de cas pratique du projet open-source `graphify`.
   visuel même sans narration.
 - **Requête par Personalized PageRank** (comme HippoRAG2), restreinte aux
   composantes connexes contenant les graines — évite qu'un résidu numérique
-  de nœuds sans rapport ne pollue la réponse.
+  de nœuds sans rapport ne pollue la réponse. **Recherche de graines
+  tolérante aux fautes de frappe** : si aucune correspondance exacte n'est
+  trouvée dans la question, une correspondance approximative
+  (`ids.fuzzy_find_symbol`, en dernier recours seulement) rattrape une
+  légère variation (ex: "checkPasswrd" -> "checkPassword") plutôt que de
+  renvoyer un résultat vide sur une question par ailleurs légitime.
 - **Réponse hiérarchique** : `_build_context()` organise la réponse en deux
   sections explicites — "faits de code certains" et "contexte documentaire
   associé" — exploitant la hiérarchie document/image/vidéo → concept →
-  code déjà présente dans le graphe, plutôt qu'une liste plate.
+  code déjà présente dans le graphe. Le contexte documentaire est en outre
+  **groupé par fichier source** ("D'après README.md :", "D'après
+  payment_service.png :") plutôt qu'une liste plate mélangeant plusieurs
+  documents — pour que la réponse reste traçable jusqu'à sa source.
+- **Résolution cross-modale insensible à la convention de nommage**
+  (`ids.normalize_identifier`) : un concept en snake_case dans un document
+  (`check_password`) est reconnu comme le même symbole qu'une méthode en
+  camelCase dans le code (`checkPassword`) — aussi fiable qu'une
+  correspondance exacte, pas une supposition, insérée entre le niveau exact
+  et le niveau approximatif de la résolution cross-modale.
 - **Cache d'extraction incrémental** (`cache.py`) : seuls les fichiers
   nouveaux ou modifiés sont réellement (re)traités. Un échec d'extraction
   n'est **jamais** mis en cache.
@@ -154,14 +168,29 @@ python -m graphmind.cli -q build ...   # silencieux (WARNING/ERROR)
 ## Tests automatisés
 
 ```bash
+# Suite complète (95 tests) — nécessite toutes les grammaires de langage
+# pour n'avoir AUCUN test ignoré (skipped) :
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest tests/ -v
+
+# Ou, sans installer les 16 grammaires, juste pytest seul (les tests des
+# langages sans grammaire installée seront alors marqués "skipped",
+# clairement visibles dans la sortie — jamais silencieusement absents) :
 pip install pytest
 python -m pytest tests/ -v
 ```
-95 tests couvrant en priorité les modules à l'origine des bugs réellement
+109 tests couvrant en priorité les modules à l'origine des bugs réellement
 rencontrés pendant le développement (résolution des collisions
 d'identifiants, préservation des relations parallèles via MultiDiGraph,
 cache qui ne retient jamais un échec, restriction du PPR aux composantes
 connexes, stabilité du warm start, rejet des hallucinations LLM).
+
+**Intégration continue** (`.github/workflows/tests.yml`) : la suite
+complète est relancée automatiquement à chaque `push`/pull request, sur
+Python 3.11 et 3.12, avec un dernier contrôle qui fait explicitement
+échouer la CI si un test venait à être ignoré (`skipped`) plutôt que
+réellement exécuté — pour ne jamais laisser passer une régression de
+couverture sans s'en apercevoir.
 
 ## Intégration à un assistant IA (Claude Code / Blackbox AI / Copilot)
 
@@ -178,7 +207,58 @@ construit, avec un garde-fou contre la lecture directe du graphe et une
 limite de reformulations avant d'admettre qu'une fonctionnalité n'existe
 pas dans le code analysé.
 
+## Périmètre de ce MVP (limitations assumées)
 
+- Extraction AST : **16 langages** (cf. principes d'architecture) via un
+  walker commun. Quelques nuances honnêtes, par langage :
+  - **Résolution des appels (`calls`)** : fonctionne pour **tous** les
+    langages, y compris **Dart** (corrigé — la syntaxe d'appel `selector`
+    est reconnue via une détection par nœud frère précédent, cf. code).
+  - **Résolution des imports** : à **trois niveaux**. D'abord
+    l'approximation "chemin de fichier -> module" (`known_modules`),
+    fiable pour Python/Java/Go. Ensuite, une **résolution cross-fichier
+    par nom de symbole** (`cli._resolve_cross_file_calls`, réutilise la
+    même table globale que pour les appels) — corrige PHP (PSR-4), Kotlin
+    et Scala, testé sur des cas réels où le chemin de fichier ne
+    correspond pas du tout au namespace déclaré. Enfin, une **résolution
+    par namespace entier déclaré** (`declared_namespace`) pour les
+    imports qui ne nomment jamais un symbole précis (`using App.Utils;`
+    en C#, contrairement à `use App\Utils\Helper;` en PHP) — corrige
+    concrètement C#, testé sur un cas réel. Garde anti-ambiguïté aux deux
+    niveaux : jamais de résolution au hasard si plusieurs candidats
+    correspondent.
+  - **Rattachement méthode -> classe** : fonctionne pour **tous** les
+    langages désormais, y compris **Go** (corrigé — une méthode à
+    récepteur `func (a *Account) M()` est maintenant rattachée au struct
+    `Account` plutôt qu'au fichier) et **Rust** (mécanisme de
+    "réouverture" pour les blocs `impl`).
+  - **PowerShell** : couvre désormais les classes PS5+ (`class_statement`
+    /`class_method_definition`), en plus des fonctions de script
+    classiques — corrigé et testé.
+  - **SQL** : couvre les fonctions/procédures stockées (`CREATE
+    FUNCTION`) ; pas de concept d'import (non pertinent en SQL standard,
+    pas une lacune à corriger).
+- La génération de légende/extraction d'image nécessite un modèle
+  réellement capable de vision (tous les modèles ne le sont pas, et le
+  catalogue change souvent chez certains fournisseurs — dépréciations
+  rencontrées plusieurs fois pendant le développement avec Groq).
+- Le clustering (Leiden comme la modularité gloutonne) reste un **recalcul
+  complet à chaque fois**, même avec le démarrage à chaud et l'avertissement
+  de taille — pas de mise à jour incrémentale des communautés au sens
+  strict. Limite structurelle partagée avec graphify et Microsoft GraphRAG.
+- La correspondance sémantique en dernier recours reste un appel LLM
+  ponctuel par FICHIER (regroupé, pas par concept individuel depuis la
+  dernière optimisation), pas un vrai index d'embeddings — plus coûteuse
+  et plus lente qu'une recherche vectorielle sur un projet avec beaucoup
+  de fichiers à concepts non résolus d'un coup.
+- Le graphe n'a pas de mémoire hiérarchique aussi élaborée que HippoRAG2
+  (document → concept → graphe de connaissances explicitement distingué à
+  chaque étape de son raisonnement). Cette hiérarchie existe déjà
+  structurellement dans le graphe (relations `contains`/`illustrates`/
+  `describes`), et `_build_context()` l'exploite désormais pour séparer
+  faits de code et contexte documentaire dans la réponse — mais reste plus
+  simple que la distinction à trois niveaux pleinement intégrée au
+  raisonnement de HippoRAG2 à chaque étape de sa requête.
 
 ## Structure du projet
 
@@ -215,5 +295,7 @@ graphmind/
 └── cli.py                              # build / cluster / status / query /
                                            init-config, contexte hiérarchique
 
-tests/              # suite pytest (95 tests)
+tests/              # suite pytest (109 tests)
+requirements-dev.txt  # dépendances complètes pour ne jamais avoir de test "skipped"
+.github/workflows/tests.yml  # CI : relance la suite à chaque push/pull request
 ```

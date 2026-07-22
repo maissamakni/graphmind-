@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 
 from .. import llm
-from ..ids import fuzzy_find_symbol, make_id
+from ..ids import build_normalized_lookup, fuzzy_find_symbol, make_id, normalize_identifier
 from ..schema import Confidence, Edge, ExtractionResult, Modality, Node
 
 _MEDIA_TYPES = {
@@ -66,6 +66,7 @@ def extract_image(
     entity_ids: dict[str, str] = {}
     seen_refs: set[str] = set()
     pending_semantic: list[tuple[str, str]] = []
+    normalized_lookup = build_normalized_lookup(known_code_symbols)
 
     for entity in entities:
         name = entity.get("name")
@@ -87,6 +88,18 @@ def extract_image(
                 relative_path, context="vision_exact_match",
             ))
         elif target_id is None:
+            # Convention de nommage différente (ex: le modèle de vision lit
+            # "check_password" affiché à l'écran, le vrai symbole est
+            # "checkPassword") — aussi fiable qu'un exact match.
+            normalized_target_id = normalized_lookup.get(normalize_identifier(name))
+            if normalized_target_id is not None and normalized_target_id not in seen_refs:
+                seen_refs.add(normalized_target_id)
+                result.edges.append(Edge(
+                    ent_id, normalized_target_id, "references", confidence,
+                    relative_path, context="vision_normalized_match",
+                ))
+                continue
+
             fuzzy_target_id = fuzzy_find_symbol(name, known_code_symbols)
             if fuzzy_target_id is not None and fuzzy_target_id not in seen_refs:
                 seen_refs.add(fuzzy_target_id)

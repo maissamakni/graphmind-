@@ -1,0 +1,55 @@
+name: Tests
+
+# Lance la suite de tests à chaque push et à chaque pull request — pour
+# être alerté immédiatement si un changement casse un comportement déjà
+# validé (cf. tests/, 95 tests couvrant les bugs réellement rencontrés
+# pendant le développement).
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:  # permet aussi un lancement manuel depuis l'onglet Actions
+
+jobs:
+  test:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Le projet nécessite Python 3.11+ (config.py utilise tomllib, dans
+      # la bibliothèque standard uniquement depuis 3.11) — la matrice
+      # couvre 3.11 (minimum supporté) et 3.12 (version courante).
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Installer Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Installer les dépendances (production + développement)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lancer la suite de tests
+        run: python -m pytest tests/ -v
+
+      - name: Vérifier qu'aucun test n'a été silencieusement ignoré
+        # Un test "skipped" indiquerait une grammaire/dépendance manquante
+        # dans requirements-dev.txt — on préfère échouer bruyamment plutôt
+        # que de laisser passer une régression de couverture inaperçue.
+        run: |
+          python -m pytest tests/ -v --tb=no -q > /tmp/pytest_output.txt 2>&1 || true
+          if grep -qi "skipped" /tmp/pytest_output.txt; then
+            echo "::error::Des tests ont été ignorés (skipped) — vérifie requirements-dev.txt"
+            cat /tmp/pytest_output.txt
+            exit 1
+          fi
+          echo "Aucun test ignoré — couverture complète confirmée."

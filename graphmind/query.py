@@ -9,15 +9,50 @@ import re
 import networkx as nx
 
 from .graph_utils import to_weighted_simple_undirected
+from .ids import fuzzy_find_symbol
 
 
 def find_seed_nodes(graph: nx.MultiDiGraph, question: str) -> list[str]:
+    """Trouve les nœuds-graines mentionnés dans la question.
+
+    Deux niveaux, du plus certain au plus tolérant :
+    1. Correspondance de mot EXACT (comme avant) — la question contient
+       littéralement le label d'un nœud.
+    2. En dernier recours, SEULEMENT si le niveau 1 ne trouve absolument
+       rien : correspondance APPROXIMATIVE (`ids.fuzzy_find_symbol`, déjà
+       utilisée ailleurs dans le projet pour la résolution cross-modale) —
+       rattrape une faute de frappe ou une légère variation dans la
+       question elle-même (ex: "checkPasswrd" au lieu de "checkPassword"),
+       pour ne pas renvoyer un résultat vide sur une question par ailleurs
+       légitime. Jamais appliqué si le niveau 1 a déjà trouvé quelque
+       chose, pour ne jamais affaiblir une correspondance déjà certaine.
+    """
     words = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", question))
+    label_by_word: dict[str, str] = {}
     seeds = []
     for node_id, data in graph.nodes(data=True):
         label = str(data.get("label", "")).strip("().").lstrip(".")
-        if label and label in words:
+        if not label:
+            continue
+        label_by_word[label] = node_id
+        if label in words:
             seeds.append(node_id)
+
+    if seeds:
+        return seeds
+
+    # Niveau 2 : aucune correspondance exacte — tente une correspondance
+    # approximative pour chaque mot substantiel de la question (les mots
+    # très courts sont ignorés, trop peu fiables pour une comparaison
+    # approximative).
+    seen_ids: set[str] = set()
+    for word in words:
+        if len(word) < 4:
+            continue
+        target_id = fuzzy_find_symbol(word, label_by_word)
+        if target_id is not None and target_id not in seen_ids:
+            seen_ids.add(target_id)
+            seeds.append(target_id)
     return seeds
 
 

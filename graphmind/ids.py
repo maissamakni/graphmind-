@@ -46,3 +46,34 @@ def fuzzy_find_symbol(name: str, known_symbols: dict[str, str], threshold: float
     if best_match is not None and best_score >= threshold:
         return known_symbols[best_match]
     return None
+
+
+def normalize_identifier(name: str) -> str:
+    """Ramène un identifiant à une forme canonique indépendante de sa
+    convention de nommage (camelCase, PascalCase, snake_case, kebab-case)
+    — "checkPassword", "CheckPassword" et "check_password" se ramènent
+    tous à "check_password". Ce n'est PAS une supposition approximative
+    comme fuzzy_find_symbol : deux identifiants qui ne diffèrent QUE par
+    leur convention d'écriture désignent authentiquement le MÊME concept
+    (cas réel : une documentation en snake_case décrivant une méthode Java
+    en camelCase) — la correspondance normalisée reste donc aussi fiable
+    qu'une correspondance exacte, pas un niveau de confiance dégradé."""
+    # Insère un underscore avant chaque majuscule qui suit une minuscule
+    # ou un chiffre (frontière camelCase -> snake_case), puis uniformise.
+    with_boundaries = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
+    lowered = with_boundaries.lower()
+    return re.sub(r"[^a-z0-9]+", "_", lowered).strip("_")
+
+
+def build_normalized_lookup(known_symbols: dict[str, str]) -> dict[str, str]:
+    """Construit une table {forme_normalisée: target_id} à partir d'une
+    table {nom_de_symbole: target_id} — pour une résolution cross-modale
+    insensible à la convention de nommage (cf. normalize_identifier).
+    En cas de collision (deux symboles distincts partagent la même forme
+    normalisée — rare), garde le premier rencontré plutôt que de deviner."""
+    lookup: dict[str, str] = {}
+    for symbol, target_id in known_symbols.items():
+        normalized = normalize_identifier(symbol)
+        if normalized not in lookup:
+            lookup[normalized] = target_id
+    return lookup

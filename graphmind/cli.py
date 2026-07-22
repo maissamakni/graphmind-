@@ -250,11 +250,20 @@ def _build_context(subgraph: dict) -> str:
     """Organise le sous-graphe en DEUX sections distinctes — faits de CODE
     certains vs CONTEXTE documentaire — exploitant la hiérarchie
     document/image/vidéo -> concept -> code déjà présente dans les données,
-    plutôt qu'une liste plate mélangeant les deux niveaux."""
+    plutôt qu'une liste plate mélangeant les deux niveaux.
+
+    Le contexte documentaire est en outre GROUPÉ PAR FICHIER SOURCE (ex:
+    "D'après README.md :", "D'après payment_service.png :") plutôt qu'une
+    liste plate mélangeant plusieurs documents — pour que la réponse finale
+    puisse distinguer d'où vient chaque affirmation, un pas vers la mémoire
+    hiérarchique document -> concept -> code (cf. HippoRAG2), sans toucher
+    à l'algorithme de requête lui-même."""
     label_by_id = {n["id"]: n.get("label", n["id"]) for n in subgraph["nodes"]}
     modality_by_id = {n["id"]: n.get("modality", "code") for n in subgraph["nodes"]}
 
-    code_facts, doc_facts = [], []
+    code_facts: list[str] = []
+    doc_facts_by_source: dict[str, list[str]] = {}
+
     for edge in subgraph["edges"]:
         src_id, tgt_id = edge.get("source"), edge.get("target")
         src = label_by_id.get(src_id, src_id)
@@ -264,15 +273,20 @@ def _build_context(subgraph: dict) -> str:
         src_modality = modality_by_id.get(src_id, "code")
         tgt_modality = modality_by_id.get(tgt_id, "code")
         if src_modality != "code" or tgt_modality != "code":
-            doc_facts.append(line)
+            source_file = edge.get("source_file") or "source inconnue"
+            doc_facts_by_source.setdefault(source_file, []).append(line)
         else:
             code_facts.append(line)
 
     parts = []
     if code_facts:
         parts.append("Faits extraits directement du code (certains) :\n" + "\n".join(code_facts))
-    if doc_facts:
-        parts.append("Contexte documentaire associé (documentation/image/vidéo) :\n" + "\n".join(doc_facts))
+    if doc_facts_by_source:
+        doc_sections = [
+            f"D'après {source_file} :\n" + "\n".join(lines)
+            for source_file, lines in sorted(doc_facts_by_source.items())
+        ]
+        parts.append("Contexte documentaire associé :\n\n" + "\n\n".join(doc_sections))
     return "\n\n".join(parts)
 
 
